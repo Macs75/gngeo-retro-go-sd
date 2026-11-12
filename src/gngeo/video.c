@@ -465,7 +465,7 @@ static __inline__ void draw_fix_char(unsigned char *buf, int start, int end) {
 	int x, y, yy;
 	unsigned char col;
 	unsigned short *br;
-	unsigned int *paldata;
+	Uint16 *paldata;
 	unsigned int byte1, byte2;
 	int banked, garouoffsets[32];
 	SDL_Rect clip;
@@ -573,7 +573,7 @@ static __inline__ void draw_fix_char(unsigned char *buf, int start, int end) {
 #elif I386_ASM
 			draw_one_char_i386(byte1, byte2, br);
 #else
-			paldata = (unsigned int *) &current_pc_pal[16 * byte2];
+			paldata = &current_pc_pal[16 * byte2];
 			gfxdata = (unsigned int *) &tile_fix[ byte1 << 5];
 
 			for (yy = 0; yy < 8; yy++) {

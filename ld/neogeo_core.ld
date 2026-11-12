@@ -68,7 +68,11 @@ SECTIONS
       build/core/frame_skip.o
       build/core/conf_stub.o
       build/core/gnutil_stub.o
+      build/core/neo_idle.o
     ) *(.text*)
+    /* the 68000 idle skip's pass runner (neo_idle.c run_in_place and its
+     * helpers): hot, in RAM; the rest of neo_idle.o is cold, in flash */
+    build/core/neo_idle.o(.ram_idle)
 
     /* Keep bridge / hot .rodata here; cold .rodata → .neo_flash. */
     EXCLUDE_FILE(
@@ -84,6 +88,7 @@ SECTIONS
       build/core/frame_skip.o
       build/core/conf_stub.o
       build/core/gnutil_stub.o
+      build/core/neo_idle.o
     ) *(.rodata*)
 
     *(.glue_7)
@@ -153,6 +158,8 @@ SECTIONS
     build/core/frame_skip.o(.text* .rodata*)
     build/core/conf_stub.o(.text* .rodata*)
     build/core/gnutil_stub.o(.text* .rodata*)
+    /* the idle-loop analysis: once per 68000 slice (neo_idle.c) */
+    build/core/neo_idle.o(.text* .rodata*)
     /* Explicit .neo_flash pieces from hot objects (e.g. ym2610_mkstate). */
     build/core/ym2610.o(.neo_flash .neo_flash.*)
     build/core/m68kcpu.o(.neo_flash .neo_flash.*)

@@ -260,6 +260,8 @@ static void host_maybe_quit(void)
         exit(0);
 }
 
+static int host_fast(void);
+
 /* --- LCD ------------------------------------------------------------------ */
 
 void lcd_clear_buffers(void)
@@ -289,9 +291,18 @@ void *lcd_get_inactive_buffer(void)
     return active_framebuffer ? framebuffer1 : framebuffer2;
 }
 
+extern uint32_t neo_rec_pic_h;
+int neo_rec_mode(void);
+
 void lcd_swap(void)
 {
     host_poll_events();
+    if (neo_rec_mode()) {           /* REC/pic: the presented picture */
+        const uint8_t *b = (const uint8_t *)lcd_get_active_buffer();
+        uint32_t h = neo_rec_pic_h;
+        for (unsigned i = 0; i < GW_LCD_WIDTH * GW_LCD_HEIGHT * 2; i++) { h ^= b[i]; h *= 16777619u; }
+        neo_rec_pic_h = h;
+    }
     /* NEO_AUTO_START=1: Robocop-style options — Down to START GAME, then A. */
     if (getenv("NEO_AUTO_START")) {
         static int phase;
@@ -308,8 +319,9 @@ void lcd_swap(void)
             phase = 9;
         }
     }
-    host_platform_present_rgb565((const uint16_t *)lcd_get_active_buffer(),
-                                 GW_LCD_WIDTH, GW_LCD_HEIGHT);
+    if (!host_fast())
+        host_platform_present_rgb565((const uint16_t *)lcd_get_active_buffer(),
+                                     GW_LCD_WIDTH, GW_LCD_HEIGHT);
     active_framebuffer ^= 1;
     frame_counter++;
     /* Optional: NEO_DUMP_FB=path.ppm after NEO_DUMP_FB_FRAME (default 180). */
@@ -347,6 +359,11 @@ void lcd_swap(void)
             }
         }
     }
+    {   /* NEO_EXIT_FRAME=N: exit after N presented frames (profiling) */
+        const char *ef = getenv("NEO_EXIT_FRAME");
+        if (ef && ef[0] && frame_counter >= (unsigned)atoi(ef))
+            exit(0);
+    }
     host_maybe_quit();
 }
 
@@ -368,7 +385,7 @@ bool lcd_sleep_while_swap_pending(void)
 void lcd_set_refresh_rate(uint32_t frequency)
 {
     if (frequency)
-        lcd_refresh_hz = frequency;
+        lcd_refresh_hz = frequency > 1000 ? (frequency + 500) / 1000 : frequency;   /* milli-Hz */
 }
 
 uint32_t lcd_get_last_refresh_rate(void)
@@ -461,11 +478,21 @@ void audio_clear_buffers(void)
     memset(audio_half_bufs, 0, sizeof(audio_half_bufs));
 }
 
+/* NEO_FAST=1: unthrottled -- no audio queue, no frame pacing, no window
+ * present (replays and profiling run as fast as the host can emulate) */
+static int host_fast(void)
+{
+    static int f = -1;
+    if (f < 0)
+        f = getenv("NEO_FAST") != NULL;
+    return f;
+}
+
 void common_emu_sound_sync(bool use_nops)
 {
     (void)use_nops;
     host_poll_events();
-    if (audio_started && !audio_muted && !audio_mute) {
+    if (!host_fast() && audio_started && !audio_muted && !audio_mute) {
         int16_t *buf = audio_get_active_buffer();
         uint16_t len = audio_get_buffer_length();
         host_platform_audio_queue(buf, (int)len);
@@ -533,6 +560,8 @@ bool common_emu_frame_loop(void)
 
     host_poll_events();
     host_maybe_quit();
+    if (host_fast())
+        return true;
 
     /* When audio is running, common_emu_sound_sync is the clock — a second
      * video sleep here fights the queue and causes underrun crackles. */
@@ -930,8 +959,12 @@ int32_t odroid_settings_app_int32_get(const char *key, int32_t value_default)
         return value_default;
     if (strcmp(key, "beep") == 0)
         return settings_beep;
-    if (strcmp(key, "neo_hw") == 0)
+    if (strcmp(key, "neo_hw") == 0) {
+        /* NEO_HW=0|1 (host): System AES / MVS without the pause menu */
+        if (settings_neo_hw < 0 && getenv("NEO_HW"))
+            settings_neo_hw = atoi(getenv("NEO_HW"));
         return settings_neo_hw >= 0 ? settings_neo_hw : value_default;
+    }
     if (strcmp(key, "neo_region") == 0)
         return settings_neo_region >= 0 ? settings_neo_region : value_default;
     return value_default;

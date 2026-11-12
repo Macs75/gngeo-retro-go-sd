@@ -25,6 +25,7 @@
 #include "timer.h"
 #include "state.h"
 #include "ym2610/ym2610.h"
+#include "neo_timing.h"
 #ifdef GP2X
 #include "ym2610-940/940shared.h"
 #endif
@@ -91,18 +92,13 @@ void my_timer(void)
 	//timer_init_save_state();
 	init = 0;
 
-	if (conf.pal) {
-		inc = ((double) (0.02) / nb_interlace);/* *(1<<TIMER_SH);*/
-			  //(conf.sound ? (double) nb_interlace : 1.0);
-	} else {
-		inc = ((double) (0.01666) / nb_interlace); /* *(1<<TIMER_SH); */
-		//(conf.sound ? (double) nb_interlace : 1.0);
-	}
+	/* the YM2610 timers count real time: one frame is NEO_FRAME_SECONDS */
+	inc = NEO_FRAME_SECONDS / nb_interlace;
 	for (i = 0; i < MAX_TIMER; i++)
 	    timers[i].del_it = 1;
     }
 
-    timer_count += inc;		/* 16ms par frame */
+    timer_count += inc;
 
     for (i = 0; i < MAX_TIMER; i++) {
 	if (timer_count >= timers[i].time && timers[i].del_it == 0) {

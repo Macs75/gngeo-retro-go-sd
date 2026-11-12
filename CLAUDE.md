@@ -313,8 +313,13 @@ Firmware `set_audio_frequency` (via `odroid_audio_init`) accepts these Hz
 values. Anything else still stores the request in
 `odroid_audio_sample_rate_get()`, but the SAI falls back to **48000**:
 
-8000, 11025, 12000, 16000, 18000, 22050, 31200, 31400, 31440, 32000,
-32768, 44100, 48000, 53050, 53267, 63360, 96000, 192000
+8000, 11025, 12000, 16000, 18000, 18518 (newer firmware only), 22050,
+31200, 31400, 31440, 32000, 32768, 44100, 48000, 53050, 53267, 63360,
+96000, 192000
+
+The Neo Geo core asks for 18518 (the YM2610's 8 MHz / 432) and reads the
+SAI's real rate back from the PLL2/SAI registers (`src/porting/neo_timing.c`)
+to fall back to 18000 on firmware without it.
 
 Half-buffer length must stay ≤ `AUDIO_BUFFER_LENGTH` (1077): e.g.
 48000/50 = 960 is fine; 192000 needs a shorter period or will not fit.

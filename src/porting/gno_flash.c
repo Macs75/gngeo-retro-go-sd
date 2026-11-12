@@ -848,7 +848,7 @@ int neo_rom_bind_regions(const char *game_id,
     memory.vid.currentpal = 0;
     memory.vid.currentfix = 0;
     current_pal = memory.vid.pal_neo[0];
-    current_pc_pal = (Uint32 *)memory.vid.pal_host[0];
+    current_pc_pal = memory.vid.pal_host[0];
     current_fix = r->bios_sfix.p;
     fix_usage = memory.fix_board_usage;
     update_all_pal();
@@ -876,6 +876,16 @@ int gno_flash_load(const char *path)
     memory.vid.spr_cache.gno = NULL;
 
     gno_err[0] = 0;
+
+    {   /* a missing or unreadable file is not a size problem */
+        FILE *fo = fopen(path, "rb");
+        if (!fo) {
+            printf("gno: cannot open %s\n", path);
+            gno_set_err("ROM file not found");
+            return GN_FALSE;
+        }
+        fclose(fo);
+    }
 
 #ifndef HOST_BUILD
     /* Refuse oversized XIP dumps before the long "Caching game…" pass.
@@ -912,8 +922,9 @@ int gno_flash_load(const char *path)
 
     mapped = odroid_overlay_cache_file_in_flash(path, &size, false);
     if (!mapped) {
+        /* size was checked above (device): a read error or a cancel */
         printf("gno: flash cache failed for %s\n", path);
-        gno_set_err("ROM too large for flash");
+        gno_set_err("ROM caching failed");
         return GN_FALSE;
     }
     if (size < 24) {
@@ -1016,7 +1027,7 @@ int gno_flash_load(const char *path)
     memory.vid.currentpal = 0;
     memory.vid.currentfix = 0;
     current_pal = memory.vid.pal_neo[0];
-    current_pc_pal = (Uint32 *)memory.vid.pal_host[0];
+    current_pc_pal = memory.vid.pal_host[0];
     current_fix = r->bios_sfix.p;
     fix_usage = memory.fix_board_usage;
     update_all_pal();

@@ -20,6 +20,13 @@ Uint8 neo_pvc_read_byte(Uint32 addr);
 void neo_pvc_write_word(Uint32 addr, Uint16 data);
 void neo_pvc_write_byte(Uint32 addr, Uint8 data);
 
+/* Metal Slug X protection (memory.c, after MAME's prot_mslugx.cpp): the
+ * cart's ALTERA chip answers at $2FFFE0-$2FFFEF. neo_mslugx_prot is set by
+ * neo_game_special_init; neo_mslugx_prot_reset() is the power-on state. */
+extern int neo_mslugx_prot;
+extern Uint16 neo_mslugx_counter, neo_mslugx_command;
+void neo_mslugx_prot_reset(void);
+
 /* Game-name hooks after ROM bind (fix bank type + PVC, etc.). */
 void neo_game_special_init(const char *name);
 

@@ -10,6 +10,7 @@
 #include "profiler.h"
 #include "gngeo_platform.h"
 #include "config.h"
+#include "neo_timing.h"
 
 #ifndef NEO_DISABLE_VIDEO
 #define NEO_DISABLE_VIDEO 0
@@ -26,6 +27,16 @@ static int fc;
 static int skip_this_frame;
 static int want_draw;
 static Uint32 tm_cycle;
+
+/* the loop's own state as at power-on (neo_rec_power_on) */
+void neo_frame_reset(void)
+{
+    fc = 0;
+    skip_this_frame = 0;
+    skip_next_frame = 0;
+    want_draw = 0;
+    tm_cycle = 0;
+}
 
 static int neo_frame_irq(void)
 {
@@ -51,8 +62,8 @@ void neo_run_frame(int draw_video)
 {
     int i;
     int a;
-    Uint32 cpu_68k_timeslice = 200000;
-    Uint32 cpu_z80_timeslice = 73333;
+    Uint32 cpu_68k_timeslice = NEO_M68K_CYCLES_PER_FRAME;
+    Uint32 cpu_z80_timeslice = NEO_Z80_CYCLES_PER_FRAME;
     Uint32 cpu_z80_timeslice_interlace = cpu_z80_timeslice / (Uint32)nb_interlace;
 
     want_draw = draw_video && !NEO_DISABLE_VIDEO;

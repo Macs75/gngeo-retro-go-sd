@@ -80,6 +80,7 @@ static const struct {
 	{ "270-p1.p1", "samsho5" },
 	{ "272-p1.p1", "samsh5sp" },
 	{ "242-p1.p1", "kof98" },
+	{ "250-p1.p1", "mslugx" },
 	{ NULL, NULL }
 };
 
@@ -209,6 +210,8 @@ static const Uint8 scramblecode_kof2000[7] = {0xEC, 15, 14, 7, 3, 10, 5};
 void neo_game_special_init(const char *name)
 {
 	neo_pvc_reset();
+	neo_mslugx_prot = 0;
+	neo_mslugx_prot_reset();
 	neogeo_fix_bank_type = 0;
 	memory.bksw_handler = 0;
 	memory.bksw_unscramble = NULL;
@@ -217,6 +220,15 @@ void neo_game_special_init(const char *name)
 
 	if (!name || !name[0])
 		return;
+
+	/* Metal Slug X: its protection chip on $2FFFE0-$2FFFEF (memory.c).
+	 * The 68000's map is built after this (setup_memory_map), and
+	 * remount_bank_window then keeps $2Fxxxx on the callbacks. */
+	if (!strcmp(name, "mslugx")) {
+		neo_mslugx_prot = 1;
+		printf("neo: mslugx protection (%s)\n", name);
+		return;
+	}
 
 	/* PVC carts. */
 	if (name_is(name, "mslug5") || !strcmp(name, "ms5pcb") ||

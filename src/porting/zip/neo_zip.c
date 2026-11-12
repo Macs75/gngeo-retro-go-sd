@@ -67,19 +67,33 @@ struct neo_zip_file {
 };
 
 static neo_zip_t      s_zip_slot;
-static neo_zip_file_t s_file_slots[NEO_ZIP_MAX_OPEN];
+/* The open-member slots (each holds a tinfl decompressor, ~8.4 KiB) live
+ * in the load-time scratch with their buffers, not in .bss: the zip is
+ * read only while a ROM is cached to flash, and the caller hands the
+ * scratch back to the RAM pool afterwards (neo_zip_flash.c, ram_init()). */
+static neo_zip_file_t *s_file_slots;
 static uint8_t       *s_scratch;
 static uint32_t       s_scratch_bytes;
 
+#define NEO_ZIP_SLOTS_OFS ((uint32_t)NEO_ZIP_MAX_OPEN * (uint32_t)NEO_ZIP_SLOT_BYTES)
+
 uint32_t neo_zip_scratch_bytes(void)
 {
-    return (uint32_t)NEO_ZIP_MAX_OPEN * (uint32_t)NEO_ZIP_SLOT_BYTES;
+    return NEO_ZIP_SLOTS_OFS + (uint32_t)(NEO_ZIP_MAX_OPEN * sizeof(neo_zip_file_t)) + 8u;
 }
 
+/* A new scratch has no member open: its slots start cleared (the caller
+ * closes every member before it re-installs the scratch). */
 void neo_zip_set_scratch(void *buf, uint32_t bytes)
 {
     s_scratch = (uint8_t *)buf;
     s_scratch_bytes = bytes;
+    s_file_slots = NULL;
+    if (s_scratch && bytes >= neo_zip_scratch_bytes()) {
+        uintptr_t a = ((uintptr_t)(s_scratch + NEO_ZIP_SLOTS_OFS) + 7u) & ~(uintptr_t)7u;
+        s_file_slots = (neo_zip_file_t *)a;
+        memset(s_file_slots, 0, NEO_ZIP_MAX_OPEN * sizeof(neo_zip_file_t));
+    }
 }
 
 static uint8_t *neo_zip_slot_io(int idx)
@@ -121,7 +135,7 @@ void neo_zip_close(neo_zip_t *z)
     int i;
     if (!z || !z->alive)
         return;
-    for (i = 0; i < NEO_ZIP_MAX_OPEN; i++) {
+    for (i = 0; s_file_slots && i < NEO_ZIP_MAX_OPEN; i++) {
         if (s_file_slots[i].in_use && s_file_slots[i].owner == z)
             neo_zip_fclose(&s_file_slots[i]);
     }
@@ -138,7 +152,7 @@ neo_zip_file_t *neo_zip_fopen(neo_zip_t *z, const char *name, uint32_t crc)
     mz_uint8 local_header[NEO_ZIP_LOCAL_HDR_SIZE];
     uint64_t data_ofs;
 
-    if (!z || !z->alive || !name)
+    if (!z || !z->alive || !name || !s_file_slots)
         return NULL;
 
     for (i = 0; i < NEO_ZIP_MAX_OPEN; i++) {

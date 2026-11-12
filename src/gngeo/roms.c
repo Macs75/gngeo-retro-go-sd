@@ -2084,7 +2084,7 @@ int init_game(char *rom_name) {
     fix_usage = memory.fix_board_usage;
     current_pal = memory.vid.pal_neo[0];
     current_fix = memory.rom.bios_sfix.p;
-    current_pc_pal = (Uint32 *) memory.vid.pal_host[0];
+    current_pc_pal = memory.vid.pal_host[0];
 
 	memory.vid.currentpal=0;
 	memory.vid.currentfix=0;

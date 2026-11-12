@@ -12,6 +12,7 @@
 #include "SDL.h"
 #include <time.h>
 #include "pd4990a.h"
+#include "neo_timing.h"
 #include "state.h"
 
 
@@ -29,7 +30,7 @@ struct pd4990a_s pd4990a =
 };
 
 static Uint32 shiftlo,shifthi;
-static int retraces = 0;		/* Assumes 60 retraces a second */
+static int retraces = 0;		/* 12 MHz cycles into the current second */
 static int testwaits = 0;
 static int maxwaits = 1;
 static int testbit = 0;		/* Pulses a bit in order to simulate */
@@ -52,10 +53,12 @@ void pd4990a_addretrace()
 	testbit ^= 1;
 	testwaits=0;
   }
-  retraces++;
-  if (retraces < 60)
+  /* one retrace per frame, NEO_FRAME_SECONDS long: the calendar keeps
+   * real time (the chip has its own 32 kHz crystal), not 60 frames/s */
+  retraces += NEO_M68K_CYCLES_PER_FRAME;
+  if (retraces < 12000000)
 	return;
-  retraces = 0;
+  retraces -= 12000000;
   pd4990a.seconds++;
   if ( (pd4990a.seconds & 0x0f) < 10 )
 	return;
@@ -83,6 +86,10 @@ void pd4990a_addretrace()
   pd4990a_increment_day();
 }
 
+/* set by a record/replay session (neo_rec.c): the date below instead of
+ * the real clock, so every run reads the same calendar */
+int pd4990a_fixed_clock;
+
 void pd4990a_init(void) {
     time_t ltime;
     struct tm *today;
@@ -97,7 +104,7 @@ void pd4990a_init(void) {
     pd4990a.year = 0x73;		/* BCD */
     pd4990a.weekday = 1;		/* BCD */
 
-    retraces = 0;		/* Assumes 60 retraces a second */
+    retraces = 0;
     testbit = 0;		/* Pulses a bit in order to simulate */
     reading=0;
     writing=0;
@@ -106,6 +113,14 @@ void pd4990a_init(void) {
     /* test output */
     outputbit = 0;
     bitno = 0;
+
+    if (pd4990a_fixed_clock) {          /* Saturday 2000-01-01 00:00:00 */
+        pd4990a.days = 0x01;
+        pd4990a.month = 1;
+        pd4990a.year = 0x00;
+        pd4990a.weekday = 6;
+        return;
+    }
 
     time(&ltime);
     today = localtime(&ltime);

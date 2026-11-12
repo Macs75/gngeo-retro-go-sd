@@ -22,6 +22,7 @@
 #include "gw_malloc.h"
 #include "neo_mem.h"
 #include "gngeo_platform.h"
+#include "neo_idle.h"
 #include "neo_pvc.h"
 
 #ifndef HOST_BUILD
@@ -295,7 +296,7 @@ static void remount_bank_window(void)
     for (i = 0x20; i <= 0x2f; i++) {
         Uint32 off = base_off + (((Uint32)(i - 0x20)) << 16);
         /* PVC cart RAM lives at $2FE000-$2FFFFF — must not use direct ROM. */
-        if ((neo_pvc_wanted() || neo_pvc_active()) && i == 0x2f) {
+        if ((neo_pvc_wanted() || neo_pvc_active() || neo_mslugx_prot) && i == 0x2f) {
             m68k.memory_map[i].base = cpu;
             m68k.memory_map[i].read8 = neo_read8;
             m68k.memory_map[i].read16 = neo_read16;
@@ -320,6 +321,7 @@ void cpu_68k_bankswitch(Uint32 address)
 {
     bankaddress = address;
     remount_bank_window();
+    m68k_fetch_invalidate();         /* the PC-fetch page cache (m68kcpu.h) */
 }
 
 void cpu_68k_reset(void)
@@ -331,6 +333,9 @@ void cpu_68k_reset(void)
     m68k.cycles = 0;
     m68k.cycle_end = 0;
     frame_cycle_base = 0;
+#if NEO_IDLE_SKIP
+    neo_idle_reset();
+#endif
 }
 void cpu_68k_mkstate(gzFile gzf, int mode)
 {
@@ -405,6 +410,9 @@ static void setup_memory_map(void)
     Uint32 cpu_sz = memory.rom.cpu_m68k.size;
     Uint32 bios_sz = memory.rom.bios_m68k.size;
 
+    m68k_fetch_invalidate();         /* the PC-fetch page cache (m68kcpu.h) */
+    m68k_fetch_page0_base = NULL;
+
     /* Default: switch callbacks (I/O, bankswitch, etc.). */
     for (i = 0; i < 256; i++) {
         m68k.memory_map[i].base = (unsigned char *)memory.ram;
@@ -423,6 +431,8 @@ static void setup_memory_map(void)
     m68k.memory_map[0].base = cpu;
     m68k.memory_map[0].read8 = neo_read8_cpu0;
     m68k.memory_map[0].read16 = neo_read16_cpu0;
+    /* the overlay is data: instruction fetches may read page 0 directly */
+    m68k_fetch_page0_base = cpu;
 
     /* $010000-$0FFFFF: direct program ROM (1 MiB window). */
     for (i = 1; i < 16; i++) {
@@ -463,9 +473,47 @@ static void setup_memory_map(void)
     printf("m68k: map direct CPU/RAM/BIOS/bank + dedicated $3C/$40\n");
 }
 
+#ifdef HOST_BUILD
+/* NEO_PCHIST=1 (host): the 68000 cycles spent at each PC (m68k_run counts
+ * them), printed at exit: the top PCs with their code words, to find the
+ * loops a game burns its frame in. NEO_PCHIST_TOP=N (default 40). */
+extern unsigned int *neo_pchist;
+
+static void neo_pchist_dump(void)
+{
+    unsigned long long total = 0;
+    unsigned int top = 40, i, k;
+    const char *e = getenv("NEO_PCHIST_TOP");
+    if (e && atoi(e) > 0)
+        top = (unsigned)atoi(e);
+    for (i = 0; i < 0x1000000; i++)
+        total += neo_pchist[i];
+    printf("PCHIST: 68000 cycles total=%llu\n", total);
+    for (k = 0; k < top; k++) {
+        unsigned int best = 0, bi = 0;
+        for (i = 0; i < 0x1000000; i++)
+            if (neo_pchist[i] > best) { best = neo_pchist[i]; bi = i; }
+        if (!best)
+            break;
+        printf("PCHIST: %06x %10u %5.2f%%  %04x %04x %04x %04x %04x\n", bi, best,
+               total ? 100.0 * best / total : 0.0,
+               neo_read16(bi), neo_read16(bi + 2), neo_read16(bi + 4),
+               neo_read16(bi + 6), neo_read16(bi + 8));
+        neo_pchist[bi] = 0;
+    }
+}
+#endif
+
 void cpu_68k_init(void)
 {
     printf("MUSASHI 68K INIT\n");
+#ifdef HOST_BUILD
+    if (getenv("NEO_PCHIST") && !neo_pchist) {
+        neo_pchist = calloc(0x1000000, sizeof(*neo_pchist));
+        if (neo_pchist)
+            atexit(neo_pchist_dump);
+    }
+#endif
     /* Hot 68k state in DTCM (~70 KiB): core + per-opcode cycle table. */
     {
         static int hot_ready;
@@ -541,6 +589,9 @@ int cpu_68k_run(Uint32 nb_cycle)
     frame_cycle_base = start;
     target = start + nb_cycle;
     m68k_run(target);
+#if NEO_IDLE_SKIP
+    neo_idle_slice_end();
+#endif
     cycles_used = m68k.cycles - start;
     return (int)(m68k.cycles - target);
 }

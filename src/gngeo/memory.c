@@ -42,7 +42,7 @@ void (*mem68k_store_bksw_long)(Uint32,Uint32);
 neo_mem memory;
 
 Uint8 *current_pal;
-Uint32 *current_pc_pal;
+Uint16 *current_pc_pal;
 Uint8 *current_fix;
 Uint8 *fix_usage;
 Uint8 sram_lock;
@@ -546,8 +546,8 @@ LONG_STORE(mem68k_store_sram)
 
 void update_all_pal(void) {
     int i;
-    Uint32 *pc_pal1 = (Uint32*) memory.vid.pal_host[0];
-    Uint32 *pc_pal2 = (Uint32*) memory.vid.pal_host[1];
+    Uint16 *pc_pal1 = memory.vid.pal_host[0];
+    Uint16 *pc_pal2 = memory.vid.pal_host[1];
     for (i = 0; i < 0x1000; i++) {
         //pc_pal1[i] = convert_pal(READ_WORD_ROM(&memory.pal1[i<<1]));
         //pc_pal2[i] = convert_pal(READ_WORD_ROM(&memory.pal2[i<<1]));
@@ -605,14 +605,14 @@ void mem68k_store_video_word(Uint32 addr, Uint16 data) {
     switch (addr) {
     case 0x0:
         memory.vid.vptr = data & 0xffff;
-        memory.vid.rbuf = READ_WORD(&memory.vid.ram[memory.vid.vptr << 1]);
+        memory.vid.rbuf = READ_WORD(&memory.vid.ram[VRAM_WORD(memory.vid.vptr) << 1]);
         break;
     case 0x2:
         //printf("Store %04x to video %08x @pc=%08x\n",data,vptr<<1,cpu_68k_getpc());
-        WRITE_WORD(&memory.vid.ram[memory.vid.vptr << 1], data);
+        WRITE_WORD(&memory.vid.ram[VRAM_WORD(memory.vid.vptr) << 1], data);
         memory.vid.vptr = (memory.vid.vptr & 0x8000) + ((memory.vid.vptr
                                                          + memory.vid.modulo) & 0x7fff);
-        memory.vid.rbuf = READ_WORD(&memory.vid.ram[memory.vid.vptr << 1]);
+        memory.vid.rbuf = READ_WORD(&memory.vid.ram[VRAM_WORD(memory.vid.vptr) << 1]);
         break;
     case 0x4:
         if (data&0x4000)
@@ -767,13 +767,13 @@ void mem68k_store_setting_byte(Uint32 addr, Uint8 data) {
     }
     if (addr == 0x000f) { /* set palette 2 */
         current_pal = memory.vid.pal_neo[1];
-        current_pc_pal = (Uint32 *) memory.vid.pal_host[1];
+        current_pc_pal = memory.vid.pal_host[1];
         memory.vid.currentpal=1;
         return;
     }
     if (addr == 0x001f) { /* set palette 1 */
         current_pal = memory.vid.pal_neo[0];
-        current_pc_pal = (Uint32 *) memory.vid.pal_host[0];
+        current_pc_pal = memory.vid.pal_host[0];
         memory.vid.currentpal = 0;
         return;
     }
@@ -815,12 +815,12 @@ void mem68k_store_setting_word(Uint32 addr, Uint16 data) {
     }
     if (addr == 0x3a000e) {
         current_pal = memory.vid.pal_neo[1];
-        current_pc_pal = (Uint32 *) memory.vid.pal_host[1];
+        current_pc_pal = memory.vid.pal_host[1];
         return;
     }
     if (addr == 0x3a001e) {
         current_pal = memory.vid.pal_neo[0];
-        current_pc_pal = (Uint32 *) memory.vid.pal_host[0];
+        current_pc_pal = memory.vid.pal_host[0];
         return;
     }
 }
@@ -860,8 +860,61 @@ Uint16 sma_random(void) {
     return old;
 }
 
+/* Metal Slug X protection: MAME's prot_mslugx.cpp (NEO-MVS PROGEOP, an
+ * ALTERA EPM7128 tied to 250-P1), installed by MAME on $2FFFE0-$2FFFEF
+ * over the bank window. Writes build a command; reads return one bit of a
+ * table in the program ROM at $0DEDD2: the next bit of a counter (command
+ * 1) or the bit 68000 work RAM $10F00A - 1 selects (command 0x0fff). A
+ * byte access is one access of the 16-bit chip (MAME's handler ignores
+ * the mask), its data in the byte's lane. */
+int neo_mslugx_prot;
+Uint16 neo_mslugx_counter, neo_mslugx_command;
+
+void neo_mslugx_prot_reset(void)
+{
+    neo_mslugx_counter = 0;
+    neo_mslugx_command = 0;
+}
+
+static Uint16 mslugx_prot_r(void)
+{
+    const Uint8 *rom = memory.rom.cpu_m68k.p;
+    Uint32 bit;
+
+    switch (neo_mslugx_command) {
+    case 0x0001:                /* $3bdc(?) and $3c30 (register D7) */
+        bit = neo_mslugx_counter++;
+        break;
+    case 0x0fff:                /* all other accesses (register D2) */
+        bit = (Uint32)((Sint32)READ_WORD_ROM(memory.ram + 0xf00a) - 1);
+        break;
+    default:
+        return 0;
+    }
+    /* space.read_byte(0xdedd2 + ((bit >> 3) & 0xfff)): program ROM bytes
+     * are stored byte-swapped in words (^1) */
+    return (Uint16)((rom[(0xdedd2u + ((bit >> 3) & 0xfffu)) ^ 1] >> (~bit & 7)) & 1);
+}
+
+static void mslugx_prot_w(Uint32 addr, Uint16 data)
+{
+    switch (addr & 0xe) {
+    case 0x0: neo_mslugx_command = 0; break;          /* start new read? */
+    case 0x2: case 0x4: neo_mslugx_command |= data; break;   /* command */
+    case 0x6: break;                                   /* finished? */
+    case 0xa: neo_mslugx_counter = 0; neo_mslugx_command = 0; break;   /* init? */
+    default: break;
+    }
+}
+
+#define MSLUGX_PROT(addr) (neo_mslugx_prot && ((addr) & 0xfffff0u) == 0x2fffe0u)
+
 /* Normal bankswitcher */
 Uint8 mem68k_fetch_bk_normal_byte(Uint32 addr) {
+    if (MSLUGX_PROT(addr)) {
+        Uint16 w = mslugx_prot_r();
+        return (Uint8)((addr & 1) ? w : w >> 8);
+    }
     if (neo_pvc_active() && (addr & 0xfffffu) >= 0xfe000u)
         return neo_pvc_read_byte(addr);
 
@@ -883,6 +936,8 @@ Uint8 mem68k_fetch_bk_normal_byte(Uint32 addr) {
 }
 
 Uint16 mem68k_fetch_bk_normal_word(Uint32 addr) {
+    if (MSLUGX_PROT(addr))
+        return mslugx_prot_r();
     if (neo_pvc_active() && (addr & 0xfffffu) >= 0xfe000u)
         return neo_pvc_read_word(addr);
 
@@ -922,6 +977,10 @@ static void bankswitch(Uint32 address, Uint8 data) {
 }
 
 void mem68k_store_bk_normal_byte(Uint32 addr, Uint8 data) {
+    if (MSLUGX_PROT(addr)) {
+        mslugx_prot_w(addr, (addr & 1) ? data : (Uint16)(data << 8));
+        return;
+    }
     if (neo_pvc_active() && (addr & 0xfffffu) >= 0xfe000u) {
         neo_pvc_write_byte(addr, data);
         return;
@@ -932,6 +991,10 @@ void mem68k_store_bk_normal_byte(Uint32 addr, Uint8 data) {
 }
 
 void mem68k_store_bk_normal_word(Uint32 addr, Uint16 data) {
+    if (MSLUGX_PROT(addr)) {
+        mslugx_prot_w(addr, data);
+        return;
+    }
     if (neo_pvc_active() && (addr & 0xfffffu) >= 0xfe000u) {
         neo_pvc_write_word(addr, data);
         return;

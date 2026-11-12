@@ -188,6 +188,10 @@ void cpu_z80_init(void)
 
     z80_reset(NULL);
     z80_set_irq_callback(mame_z80_irq_callback);
+    {
+        void neo_z80i_reset(void);
+        neo_z80i_reset();           /* the Z80 idle skip (mamez80/z80.c) */
+    }
     printf("z80: banked page-table RM (DTCM, no 64KiB mirror)\n");
 }
 

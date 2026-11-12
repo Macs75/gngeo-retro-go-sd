@@ -305,8 +305,10 @@ int screen_init(void)
     /*
      * Device: draw straight into the 320×240 LCD FB. No 16px gutter —
      * that cropped the right edge 16px early vs host's 352-wide buffer.
-     * y=8 so the 224-line viewport already sits on the letterboxed panel
-     * (dst_y=8) — present skips a 140 KiB memmove and only fills bars.
+     * The renderer writes raster line L to FB row L (0..239); the Neo Geo
+     * shows lines 16..239 (MAME's visible area, the host's y=16), so
+     * present moves those 224 rows up to rows 8..231 (one DMA2D copy)
+     * and blacks the 8-row bars.
      */
     conf.screen320 = 1;
     buffer = alloc_lcd_surface();
@@ -314,7 +316,7 @@ int screen_init(void)
     if (!buffer)
         return GN_FALSE;
     visible_area.x = 0;
-    visible_area.y = 8;
+    visible_area.y = 16;
     visible_area.w = 320;
     visible_area.h = 224;
 #endif
@@ -329,11 +331,18 @@ void screen_fullscreen(void) {}
 void sdl_set_title(char *name) { (void)name; }
 
 #ifndef HOST_BUILD
+/* Set when the LCD buffer is handed to the renderer, cleared once present
+ * has moved the visible rows into place: present on a buffer it already
+ * moved (Screenshot) only refills the bars. */
+static int fb_raw;
+
 void neo_bind_lcd_buffer(void)
 {
     uint16_t *fb = lcd_get_active_buffer();
-    if (buffer && fb)
+    if (buffer && fb) {
         buffer->pixels = fb;
+        fb_raw = 1;
+    }
 }
 
 /* DMA2D solid fill (RGB565). Returns 0 on success. */
@@ -421,13 +430,20 @@ void neo_present_to_lcd(uint16_t *fb)
 
 #ifndef HOST_BUILD
     /*
-     * Device draws into the LCD back-buffer. When the crop already matches
-     * the panel (full 320 wide), only letterbox the 224→240 vertical gap.
-     * Avoid a no-op memmove that used to shuffle a 304-wide gutter crop.
+     * Device draws into the LCD back-buffer: move the visible rows (16..239)
+     * to the panel's rows 8..231 once per render, then letterbox the
+     * 224→240 vertical gap.
      */
     if (buffer->pixels == (void *)fb) {
-        if (src_x != dst_x || src_y != dst_y) {
-            if (dst_y < src_y) {
+        if (fb_raw && (src_x != dst_x || src_y != dst_y)) {
+            /* Full-width rows moving up: one DMA2D copy. Every pixel lands
+             * above its source, so the copy, in address order, overwrites
+             * only rows it has already read. */
+            if (src_x == 0 && dst_x == 0 && vw == 320 && dst_y < src_y &&
+                neo_dma2d_blit(fb + src_y * 320, fb + dst_y * 320,
+                               320, (uint16_t)vh) == 0) {
+                /* moved */
+            } else if (dst_y < src_y) {
                 for (y = 0; y < vh; y++) {
                     uint16_t *row = fb + (src_y + y) * 320 + src_x;
                     memmove(fb + (dst_y + y) * 320 + dst_x, row, (size_t)vw * 2);
@@ -439,6 +455,7 @@ void neo_present_to_lcd(uint16_t *fb)
                 }
             }
         }
+        fb_raw = 0;
         neo_letterbox(fb, dst_x, dst_y, vw, vh);
         return;
     }

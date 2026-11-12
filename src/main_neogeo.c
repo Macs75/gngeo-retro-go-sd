@@ -6,6 +6,9 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef HOST_BUILD
+#include <stdlib.h>
+#endif
 
 #include "common.h"
 #include "gw_lcd.h"
@@ -43,6 +46,9 @@
 #include "neo_flash_ro.h"
 #include "neo_settings.h"
 #include "ym2610/ym2610.h"
+#include "profiler.h"
+#include "neo_rec.h"
+#include "neo_timing.h"
 
 extern void (**m68ki_instruction_jump_table)(void);
 
@@ -51,15 +57,13 @@ extern void (**m68ki_instruction_jump_table)(void);
 #endif
 
 #define APP_ID       APPID_CORE
-#define FPS          60
-#define SAMPLE_RATE  18000
-#define AUDIO_LENGTH (SAMPLE_RATE / FPS) /* 300 — exact */
 
 static odroid_gamepad_state_t pad;
 static const char *boot_fail_reason = NULL;
 
 static bool LoadState(const char *path)
 {
+    neo_rec_close();                 /* a loaded state ends a record/replay */
     return neo_load_state_path(path) != 0;
 }
 
@@ -96,16 +100,79 @@ static void neo_apply_cpu_clock(void)
 
 /* Hard restart SAI/DMA. Needed after long silent gaps (ROM load) and after
  * SystemClock_Config (audio PLL). audio_start_playing alone can no-op if SAI
- * is still BUSY from a previous half-buffer. */
+ * is still BUSY from a previous half-buffer.
+ *
+ * PHASE: the LCD runs at the audio-paced frame rate (neo_timing.c; the
+ * two drift apart by about one scan line in 19 minutes), so the point of
+ * the scan where each frame's audio wait ends -- and the loop draws and
+ * swaps -- is fixed for the whole session, set by the moment the DMA
+ * starts. A swap only shows at the start of vertical blanking (VBR
+ * reload, scan line 248 of 256: 8 sync/back-porch lines, 240 active, 8
+ * front porch). If the draw straddles that line, every swap misses it, is
+ * still pending at the next frame's check, and every other picture is
+ * dropped for the whole session (30 fps).
+ *
+ * So the DMA starts at scan line NEO_SYNC_LINE, a little after the
+ * blanking: the check then comes 40 lines (2.6 ms) after the previous
+ * swap showed, and the draw has 216 lines (14 ms) to swap before the next
+ * blanking. NOT right after lcd_wait_for_vblank(): its line interrupt is
+ * at line 239, 9 lines before the reload, which left the draw 0.6 ms
+ * (heavy scenes then ran at 30 fps). gw-arcade-core can start there
+ * because it emulates before it draws, so its swaps land mid-frame.
+ * The first wait lets a re-programmed PLL3 (neo_timing_apply) settle. */
+#define NEO_SYNC_LINE 32u
 static void neo_audio_start(void)
 {
     audio_stop_playing();
-    odroid_audio_init(SAMPLE_RATE);
+    odroid_audio_init(neo_timing_rate());
     audio_clear_buffers();
-    audio_start_playing(AUDIO_LENGTH);
+    lcd_wait_for_vblank();
+    lcd_wait_for_vblank();               /* the line 239 interrupt */
+#ifndef HOST_BUILD
+    for (;;) {                           /* through the blanking to NEO_SYNC_LINE */
+        uint32_t y = lcd_get_pixel_position() & 0xffffu;   /* LTDC CPSR.CYPOS */
+        if (y >= NEO_SYNC_LINE && y < 239u)
+            break;
+    }
+#endif
+    audio_start_playing((uint16_t)neo_timing_spf());
     if (common_emu_state.pause_after_frames == 0)
         odroid_audio_mute(false);
 }
+
+#ifndef HOST_BUILD
+/* PHASE watchdog: the start-up alignment (neo_audio_start) holds only as
+ * long as nothing else restarts the audio DMA or re-programs the LCD clock
+ * (the firmware's pause menu only mutes; its sleep/power paths stop the
+ * DMA, then SleepWake realigns). Rather than trust every path, watch the
+ * symptom: when 20 or more of 60 pictures are dropped because the last
+ * swap is still pending, the draw straddles the LCD's vblank -- realign.
+ * A restart costs ~50 ms of silence, so at most one per 600 frames (a
+ * scene that drops pictures because it overruns the frame would otherwise
+ * restart the audio over and over). */
+#define NEO_PHASE_WINDOW    60u
+#define NEO_PHASE_MAX_DROPS 20u
+#define NEO_PHASE_COOLDOWN  600u
+static void neo_phase_watch(int vskip)
+{
+    static uint16_t frames, drops, cool;
+
+    if (cool) {
+        cool--;
+        return;
+    }
+    drops += (uint16_t)vskip;
+    if (++frames < NEO_PHASE_WINDOW)
+        return;
+    if (drops >= NEO_PHASE_MAX_DROPS) {
+        printf("neogeo: %u of %u pictures dropped (swap pending): realigning the audio to the LCD\n",
+               (unsigned)drops, (unsigned)frames);
+        neo_audio_start();
+        cool = NEO_PHASE_COOLDOWN;
+    }
+    frames = drops = 0;
+}
+#endif
 
 static void SleepWake(void)
 {
@@ -114,12 +181,14 @@ static void SleepWake(void)
      * OC was already non-zero. */
     if (odroid_settings_cpu_oc_level_get() == 0)
         SystemClock_Config(2);
-    neo_audio_start();
+    neo_timing_apply();              /* the resume may have reset the LCD rate */
+    neo_audio_start();               /* and restarts the DMA: realign the phase */
 }
 
 static void SramSave(void)
 {
     /* TODO: write memory.sram via ODROID_PATH_SAVE_SRAM when dirty */
+    neo_rec_close();                 /* quit / sleep: the recording gets its frame count */
 }
 
 static void map_input(const odroid_gamepad_state_t *joy)
@@ -152,10 +221,12 @@ static void map_input(const odroid_gamepad_state_t *joy)
     if (joy->values[ODROID_INPUT_LEFT])  buttons |= 0x40;
     if (joy->values[ODROID_INPUT_RIGHT]) buttons |= 0x80;
 
-    /* START + SELECT(coin/select). */
-    neo_set_input(buttons,
-                  joy->values[ODROID_INPUT_START] ? 1 : 0,
-                  joy->values[ODROID_INPUT_SELECT] ? 1 : 0);
+    /* START + SELECT(coin/select); recorded or replayed (neo_rec.c) */
+    uint16_t in = (uint16_t)(buttons |
+                             (joy->values[ODROID_INPUT_START] ? 0x100 : 0) |
+                             (joy->values[ODROID_INPUT_SELECT] ? 0x200 : 0));
+    in = neo_rec_input(in);
+    neo_set_input((Uint8)in, (in & 0x100) ? 1 : 0, (in & 0x200) ? 1 : 0);
 }
 
 static void submit_audio(void)
@@ -172,10 +243,12 @@ static void submit_audio(void)
 
     if (!neo_sound_gen_enabled()) {
         memset(buf, 0, (size_t)len * sizeof(int16_t));
+        neo_rec_frame_done(buf, (int)len);
         return;
     }
 
     neo_render_audio(buf, (int)len);
+    neo_rec_frame_done(buf, (int)len);   /* before the volume: the machine's output */
     vol = common_emu_sound_get_volume();
     if (vol < 255) {
         for (i = 0; i < (int)len; i++)
@@ -202,7 +275,7 @@ static bool boot_game(void)
     cf_init();
     cf_get_item_by_name("dump"); /* ensure dump=true default */
     conf.sound = 1;
-    conf.sample_rate = SAMPLE_RATE;
+    conf.sample_rate = neo_timing_rate();
     conf.screen320 = 1;
     conf.system = SYS_UNIBIOS;
     conf.country = CTY_EUROPE; /* overwritten by neo_settings_apply_unibios */
@@ -329,12 +402,15 @@ static void neo_region_to_str(neo_region_t region, char *buf)
 
 static void neo_apply_and_reset(void)
 {
+    neo_rec_close();                 /* a reset ends a record/replay */
     /*
      * UniBIOS reads region/mode once into 68k RAM at power-on; a plain
      * cpu_68k_reset keeps those values. Clear work RAM + restamp BRAM/
      * memcard + BIOS vectors so the splash re-reads our options.
      */
     neo_settings_apply_unibios();
+    neo_timing_apply();              /* the System sets the frame rate */
+    neo_audio_start();
     memset(memory.ram, 0, 0x10000);
     neo_vector_use_bios();
     neogeo_reset();
@@ -405,6 +481,34 @@ static bool update_swap_cd_cb(odroid_dialog_choice_t *option,
     return event == ODROID_DIALOG_ENTER;
 }
 
+/* Record / replay (neo_rec.c): actions, not toggles -- the label says what
+ * selecting the entry does. */
+static bool rec_record_cb(odroid_dialog_choice_t *option, odroid_dialog_event_t event,
+                          uint32_t repeat)
+{
+    (void)option; (void)repeat;
+    if (event == ODROID_DIALOG_ENTER) {
+        if (neo_rec_mode() == NEO_REC_RECORD)
+            neo_rec_close();
+        else
+            neo_rec_start(NEO_REC_RECORD, ACTIVE_FILE ? ACTIVE_FILE->path : NULL);
+    }
+    return event == ODROID_DIALOG_ENTER;
+}
+
+static bool rec_replay_cb(odroid_dialog_choice_t *option, odroid_dialog_event_t event,
+                          uint32_t repeat)
+{
+    (void)option; (void)repeat;
+    if (event == ODROID_DIALOG_ENTER) {
+        if (neo_rec_mode() == NEO_REC_REPLAY)
+            neo_rec_close();
+        else
+            neo_rec_start(NEO_REC_REPLAY, ACTIVE_FILE ? ACTIVE_FILE->path : NULL);
+    }
+    return event == ODROID_DIALOG_ENTER;
+}
+
 void app_main_neogeo(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 {
     odroid_gamepad_state_t joystick;
@@ -428,10 +532,11 @@ void app_main_neogeo(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     } else {
         common_emu_state.pause_after_frames = 0;
     }
-    common_emu_state.frame_time_10us = (uint16_t)(100000 / FPS + 0.5f);
-    lcd_set_refresh_rate(FPS);
-
-    odroid_system_init(APP_ID, SAMPLE_RATE);
+    /* the real frame rate: the audio rate, samples per frame, frame time
+     * and LCD refresh for the System (neo_timing.c) */
+    odroid_system_init(APP_ID, NEO_AUDIO_RATE_NATIVE);
+    neo_timing_probe();
+    neo_timing_apply();
     odroid_system_emu_init(&LoadState, &SaveState, &Screenshot,
                            NULL, &SleepWake, &SramSave, NULL);
 
@@ -458,26 +563,42 @@ void app_main_neogeo(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
         lcd_clear_buffers();
 
     neo_audio_start();
+    NEO_PROF_INIT();
+#ifdef HOST_BUILD
+    /* NEO_RECORD=1 / NEO_REPLAY=1: from power-on at start-up, or at loop
+     * frame NEO_REC_AT (a replay started mid-session must log the same
+     * REC/hash lines); the recording is closed at exit */
+    uint32_t host_loop_frame = 0, host_rec_at = 0;
+    int host_rec_mode = getenv("NEO_RECORD") ? NEO_REC_RECORD :
+                        getenv("NEO_REPLAY") ? NEO_REC_REPLAY : NEO_REC_OFF;
+    if (getenv("NEO_REC_AT"))
+        host_rec_at = (uint32_t)atoi(getenv("NEO_REC_AT"));
+    atexit(neo_rec_close);
+#endif
 
     while (1) {
         wdog_refresh();
 
         bool draw_frame = common_emu_frame_loop();
-        /* Like main_gw: never blit while LTDC still owns the active FB.
-         * Do not lcd_sleep_while_swap_pending() here — audio sync paces us. */
         bool can_present = draw_frame && !NEO_DISABLE_VIDEO;
-#ifndef HOST_BUILD
-        if (lcd_is_swap_pending())
-            can_present = false;
-#endif
 
+#ifdef HOST_BUILD
+        if (host_rec_mode != NEO_REC_OFF && host_loop_frame == host_rec_at) {
+            neo_rec_start(host_rec_mode, ACTIVE_FILE ? ACTIVE_FILE->path : NULL);
+            host_rec_mode = NEO_REC_OFF;
+        }
+        host_loop_frame++;
+#endif
         odroid_input_read_gamepad(&joystick);
         {
+            int rm = neo_rec_mode();
             odroid_dialog_choice_t options[] = {
                 {100, "System", neo_opt_hw_str, 1, &update_hw_cb},
                 {101, "Region", neo_opt_region_str, 1, &update_region_cb},
                 {102, "Swap A/B", neo_opt_swap_ab_str, 1, &update_swap_ab_cb},
                 {103, "Swap C/D", neo_opt_swap_cd_str, 1, &update_swap_cd_cb},
+                {104, rm == NEO_REC_RECORD ? "Stop recording" : "Record input", NULL, 1, &rec_record_cb},
+                {105, rm == NEO_REC_REPLAY ? "Stop replay" : "Replay input", NULL, 1, &rec_replay_cb},
                 ODROID_DIALOG_CHOICE_LAST
             };
             common_emu_input_loop(&joystick, options, &neo_repaint);
@@ -488,18 +609,46 @@ void app_main_neogeo(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
 
         /* Emu first, then audio, then video. A slow draw_screen must not
          * sit between YM fill and DMA — that was the voice chop/repeat. */
+        NEO_PROF_MARK(NEO_PH_FRAMECTL);
         neo_run_frame(can_present ? 1 : 0);
+        NEO_PROF_MARK(NEO_PH_EMU);
         submit_audio();
+        NEO_PROF_MARK(NEO_PH_AUDIO);
         common_emu_sound_sync(false);
+        NEO_PROF_MARK(NEO_PH_WAIT);
 
-        if (neo_frame_needs_draw()) {
+        int drawn = neo_frame_needs_draw(), vskip = 0;
+#ifndef HOST_BUILD
+        /* Never draw while LTDC still shows the back buffer: the last
+         * lcd_swap() takes effect at the LCD's next vertical blank. If it
+         * has not happened yet, this frame's picture is DROPPED, not waited
+         * for: the loop runs on the audio DMA's clock (common_emu_sound_sync)
+         * and the LCD on its own PLL3 at nearly the same rate (neo_timing.c:
+         * the two drift slowly in phase), and
+         * sleeping until the vblank here made the loop miss audio buffers
+         * whenever the two phases met (the audio hung, and every cycle the
+         * emulation saved went into that sleep). Checked HERE, after the
+         * audio wait, about a frame after the last swap, it is rarely still
+         * pending; checked before the emulation, a few microseconds after
+         * the swap, it always was (every other frame undrawn: 30 fps). */
+        if (drawn && lcd_is_swap_pending()) {
+            drawn = 0;
+            vskip = 1;
+        }
+        neo_phase_watch(vskip);
+#endif
+        if (drawn) {
 #ifndef HOST_BUILD
             neo_bind_lcd_buffer();
 #endif
+            NEO_PROF_MARK(NEO_PH_VWAIT);
             neo_draw_frame();
+            NEO_PROF_MARK(NEO_PH_VIDEO);
             neo_present_to_lcd(lcd_get_active_buffer());
             common_ingame_overlay();
             lcd_swap();
+            NEO_PROF_MARK(NEO_PH_PRESENT);
         }
+        NEO_PROF_FRAME_END(drawn, !draw_frame, vskip);
     }
 }

@@ -38,11 +38,17 @@ typedef struct gfx_cache {
     Uint8* in_buf;
 }GFX_CACHE;
 
+#define VRAM_BYTES 0x11000
+/* a VRAM word address through the LSPC address register: the upper 2K
+ * words repeat over 0x8000-0xFFFF, as MAME's set_videoram_offset */
+#define VRAM_WORD(o) (((o) & 0x8000) ? (0x8000 | ((o) & 0x7ff)) : ((o) & 0x7fff))
+
 typedef struct VIDEO {
-	/* Video Ram&Pal */
-	Uint8 ram[0x20000];
+	/* Video Ram&Pal. The LSPC's VRAM: 0x8000 words (SCB1 + fix) and 0x800
+	 * upper words (SCB2-4), mirrored over 0x8000-0xFFFF (VRAM_WORD) */
+	Uint8 ram[VRAM_BYTES];
 	Uint8 pal_neo[2][0x2000];
-	Uint8 pal_host[2][0x4000];
+	Uint16 pal_host[2][0x1000];     /* RGB565, the screen's format */
 	Uint8 currentpal;
         Uint8 currentfix; /* 0=bios fix */
 	Uint16 rbuf;

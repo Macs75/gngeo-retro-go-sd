@@ -10,7 +10,7 @@ GPL-licensed Neo Geo AES/MVS emulator core for
 | ROMs | `/roms/neogeo/*.{zip,neo,gno}` (see below) |
 | BIOS | `/bios/neogeo/` (shared, not inside each `.gno`) |
 | Entry | `app_main_neogeo` |
-| Audio | YM2610 @ 18000 Hz mono |
+| Audio | YM2610 @ 18518.5 Hz mono (8 MHz / 432; 18000 Hz on firmware without it) |
 | Video | Soft LSPC → RGB565 320×224 centered on 320×240 |
 
 Based on [GnGeo](https://github.com/pepone42/gngeo) with a Musashi/gwenesis

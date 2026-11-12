@@ -259,8 +259,81 @@ void m68k_set_irq_delay(unsigned int int_level)
   m68ki_check_interrupts(); /* Level triggered (IRQ) */
 }
 
+#include "neo_idle.h"
+#if NEO_IDLE_SKIP
+/* the armed idle loop's head reached (src/porting/neo_idle.c): the first
+ * time, a pass is traced; then, when the head comes round exactly one pass
+ * after the last time (the PC went round the loop), all but the last of
+ * the whole passes left in the slice are taken by neo_idle_run (consumed
+ * at once, or run natively), the rest runs here for real */
+static void neo_idle_hit(void)
+{
+  uint c = m68k.cycles, d, laps, done;
+  if (neo_idle_lap == 0) {
+    neo_idle_trace();
+    neo_idle_last = c;
+    return;
+  }
+  d = c - neo_idle_last;
+  neo_idle_last = c;
+  if (d != neo_idle_lap)
+    return;
+  laps = (m68k.cycle_end - c) / d;
+  if (laps < 2)
+    return;
+  done = neo_idle_run(laps - 1);       /* cycles taken; REG_PC moved if a pass stopped */
+  if (!done)
+    return;
+  m68k.cycles += done - neo_idle_bug;
+  neo_idle_last = m68k.cycles;
+  neo_idle_skipped += done;
+  neo_idle_skips++;
+#ifdef HOST_BUILD
+  if (neo_idle_log > 1)
+    printf("IDLE: skip at %06x: %u cycles of %u-cycle passes, cycles %u..%u, on at %06x\n", neo_idle_head, done, d, c, m68k.cycle_end, REG_PC);
+#endif
+}
+#endif
+
+#ifdef HOST_BUILD
+/* NEO_PCHIST=1 (host): 68000 cycles spent at each PC, printed at exit by
+ * neo_pchist_dump (src/porting/neo_rec.c) */
+unsigned int *neo_pchist;
+#endif
+
+/* the PC-fetch page cache (m68kcpu.h) */
+struct m68k_fetch_cache m68k_fc = { 0xffffffffu, 0 };
+unsigned char *m68k_fetch_page0_base;
+void m68k_fetch_invalidate(void) { m68k_fc.page = 0xffffffffu; }
+
+unsigned int m68k_fetch16_miss(unsigned int address)
+{
+  unsigned int pg = (address >> 16) & 0xff;
+  cpu_memory_map *m = &m68ki_cpu.memory_map[pg];
+  unsigned char *base;
+
+  if (!m->read16)
+    base = m->base;
+  else if (pg == 0 && m68k_fetch_page0_base)
+    base = m68k_fetch_page0_base;
+  else
+    return (*m->read16)(ADDRESS_68K(address));
+  m68k_fc.page = pg;
+  m68k_fc.base = base;
+  return *(uint16 *)(base + (address & 0xffff));
+}
+
+#ifdef NEO_PROF
+/* instructions Musashi executed (PROF/cpi: device cycles per instruction) */
+unsigned int neo_m68k_icount;
+#endif
+
 void m68k_run(unsigned int cycles) 
 {
+#ifdef NEO_PROF
+  unsigned int icount = 0;
+#endif
+  m68k_fetch_invalidate();
     //  printf("m68K_run current_cycles=%d add=%d STOP=%x\n",m68k.cycles,cycles,CPU_STOPPED);
 
   /* Make sure CPU is not already ahead */
@@ -303,18 +376,45 @@ void m68k_run(unsigned int cycles)
       cpu_hook(HOOK_M68K_E, 0, REG_PC, 0);
 #endif
 
+#if NEO_IDLE_SKIP
+    if (REG_PC == neo_idle_head)
+      neo_idle_hit();
+#endif
+#ifdef HOST_BUILD
+    unsigned int hist_pc = REG_PC, hist_c0 = m68k.cycles;
+    if (REG_PC < 0x80 && m68k_fetch_page0_base) {
+      /* the page cache serves page 0 without the vector overlay */
+      static int warned;
+      if (!warned++)
+        printf("m68k: executing at %06x, in the vector table\n", REG_PC);
+    }
+#endif
+#ifdef NEO_PROF
+    icount++;
+#endif
     /* Decode next instruction */
+#if M68K_EMULATE_PREFETCH || M68K_CHECK_PC_ADDRESS_ERROR
     REG_IR = m68ki_read_imm_16();
+#else
+    REG_IR = m68ki_read_opcode_16();
+#endif
 
 //    printf("PC=%x IR=%x CYCLES=%d \n",m68k.pc,REG_IR,CYC_INSTRUCTION[REG_IR]);
 
     /* Execute instruction */
     m68ki_instruction_jump_table[REG_IR]();
     USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+#ifdef HOST_BUILD
+    if (neo_pchist)
+      neo_pchist[hist_pc & 0xffffff] += m68k.cycles - hist_c0;
+#endif
 
     /* Trace m68k_exception, if necessary */
     m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */
   }
+#ifdef NEO_PROF
+  neo_m68k_icount += icount;
+#endif
 }
 
 int m68k_cycles(void)

@@ -15,7 +15,7 @@ static __inline__ void RENAME(draw)(unsigned int tileno,int sx,int sy,int zx,int
     int y;
     unsigned char col;
     unsigned short *br;
-    unsigned int *paldata=(unsigned int *)&current_pc_pal[16*color];
+    Uint16 *paldata=&current_pc_pal[16*color];
     char *l_y_skip;
     int l; // Line skipping counter
 #ifdef DEBUG_VIDEO
@@ -329,7 +329,7 @@ static inline void RENAME(draw_scanline)(unsigned int tileno,int yoffs,int sx,in
     unsigned int *gfxdata,myword;
     unsigned char col;
     unsigned short *br;
-    unsigned int *paldata=(unsigned int *)&current_pc_pal[16*color];
+    Uint16 *paldata=&current_pc_pal[16*color];
 
     tileno=tileno%memory.nb_of_tiles;
     gfxdata = (unsigned int *)&memory.rom.tiles.p[ (tileno<<7)];

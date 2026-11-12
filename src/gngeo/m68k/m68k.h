@@ -475,6 +475,12 @@ extern void m68k_init(void);
  */
 extern void m68k_pulse_reset(void);
 
+/* the PC-fetch page cache (m68kcpu.h): invalidate after changing the page
+ * map; page 0's direct base for instruction fetches (its handler only
+ * overlays the vector table) or NULL */
+void m68k_fetch_invalidate(void);
+extern unsigned char *m68k_fetch_page0_base;
+
 /* Run until given cycle count is reached */
 extern void m68k_run(unsigned int cycles);
 

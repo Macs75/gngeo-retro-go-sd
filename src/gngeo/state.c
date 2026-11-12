@@ -315,10 +315,10 @@ int load_state(char *game,int slot) {
 
 	if (memory.vid.currentpal) {
 		current_pal = memory.vid.pal_neo[1];
-		current_pc_pal = (Uint32 *) memory.vid.pal_host[1];
+		current_pc_pal = memory.vid.pal_host[1];
 	} else {
 		current_pal = memory.vid.pal_neo[0];
-		current_pc_pal = (Uint32 *) memory.vid.pal_host[0];
+		current_pc_pal = memory.vid.pal_host[0];
 	}
 
 	if (memory.vid.currentfix) {

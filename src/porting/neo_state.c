@@ -26,9 +26,29 @@
 #endif
 
 /* "NEOS02" = + PVC cart RAM (mslug5 / svc / kof2003). NEOS01 still loads. */
-#define NEO_SS_MAGIC    "NEOS02"
-#define NEO_SS_MAGIC_V1 "NEOS01"
+/* NEOS03: VRAM is the LSPC's 0x8800 words, the host palettes RGB565.
+ * Older states (NEOS01/02: 0x10000 VRAM words, 32-bit host palettes)
+ * are refused. */
+/* NEOS04: + the Metal Slug X protection chip's counter and command after
+ * the PVC section (4 bytes, every game). NEOS03 still loads, the chip at
+ * its power-on state. */
+#define NEO_SS_MAGIC    "NEOS04"
+#define NEO_SS_MAGIC_V3 "NEOS03"
 #define NEO_SS_MAGIC_LEN 6
+
+static int rw_ok(gzFile f, void *p, int sz, int mode);
+
+static int neo_ss_mslugx(gzFile f, int mode)
+{
+    Uint16 v[2] = { neo_mslugx_counter, neo_mslugx_command };
+    if (!rw_ok(f, v, (int)sizeof(v), mode))
+        return 0;
+    if (mode == STREAD) {
+        neo_mslugx_counter = v[0];
+        neo_mslugx_command = v[1];
+    }
+    return 1;
+}
 
 SDL_Surface *state_img;
 Uint8 state_version = ST_VER3;
@@ -123,7 +143,7 @@ static int neo_ss_body(gzFile f, int mode)
 
     if (!rw_ok(f, memory.ram, 0x10000, mode))
         return 0;
-    if (!rw_ok(f, memory.vid.ram, 0x20000, mode))
+    if (!rw_ok(f, memory.vid.ram, sizeof(memory.vid.ram), mode))
         return 0;
     if (!rw_ok(f, memory.vid.pal_neo, sizeof(memory.vid.pal_neo), mode))
         return 0;
@@ -182,10 +202,10 @@ static int neo_ss_body(gzFile f, int mode)
 
         if (memory.vid.currentpal) {
             current_pal = memory.vid.pal_neo[1];
-            current_pc_pal = (Uint32 *)memory.vid.pal_host[1];
+            current_pc_pal = memory.vid.pal_host[1];
         } else {
             current_pal = memory.vid.pal_neo[0];
-            current_pc_pal = (Uint32 *)memory.vid.pal_host[0];
+            current_pc_pal = memory.vid.pal_host[0];
         }
         if (memory.vid.currentfix) {
             current_fix = memory.rom.game_sfix.p;
@@ -260,7 +280,8 @@ int neo_save_state_path(const char *path)
 #endif
     if (fwrite(NEO_SS_MAGIC, 1, NEO_SS_MAGIC_LEN, f) != NEO_SS_MAGIC_LEN
         || !neo_ss_body(f, STWRITE)
-        || !neo_ss_pvc(f, STWRITE, 1)) {
+        || !neo_ss_pvc(f, STWRITE, 1)
+        || !neo_ss_mslugx(f, STWRITE)) {
         printf("neogeo: save write fail\n");
         fclose(f);
         return 0;
@@ -274,7 +295,7 @@ int neo_load_state_path(const char *path)
 {
     FILE *f;
     char magic[NEO_SS_MAGIC_LEN];
-    int have_pvc;
+    int have_pvc, have_mslugx = 0;
     if (!path || !path[0])
         return 0;
     f = fopen(path, "rb");
@@ -291,15 +312,18 @@ int neo_load_state_path(const char *path)
         return 0;
     }
     if (memcmp(magic, NEO_SS_MAGIC, NEO_SS_MAGIC_LEN) == 0)
+        have_pvc = have_mslugx = 1;
+    else if (memcmp(magic, NEO_SS_MAGIC_V3, NEO_SS_MAGIC_LEN) == 0)
         have_pvc = 1;
-    else if (memcmp(magic, NEO_SS_MAGIC_V1, NEO_SS_MAGIC_LEN) == 0)
-        have_pvc = 0;
     else {
-        printf("neogeo: bad savestate magic\n");
+        printf("neogeo: savestate from an older core version (or not one), not loaded\n");
         fclose(f);
         return 0;
     }
-    if (!neo_ss_body(f, STREAD) || !neo_ss_pvc(f, STREAD, have_pvc)) {
+    if (!have_mslugx)
+        neo_mslugx_prot_reset();
+    if (!neo_ss_body(f, STREAD) || !neo_ss_pvc(f, STREAD, have_pvc)
+        || (have_mslugx && !neo_ss_mslugx(f, STREAD))) {
         printf("neogeo: load read fail\n");
         fclose(f);
         return 0;

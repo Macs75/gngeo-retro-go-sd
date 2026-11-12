@@ -28,6 +28,10 @@ $(PORT)/zip/neo_zip.c \
 $(PORT)/zip/miniz.c \
 $(PORT)/neo_flash_ro.c \
 $(PORT)/neo_frame.c \
+$(PORT)/neo_prof.c \
+$(PORT)/neo_rec.c \
+$(PORT)/neo_timing.c \
+$(PORT)/neo_idle.c \
 $(PORT)/event.c \
 $(PORT)/neo_settings.c \
 $(PORT)/conf_stub.c \
@@ -87,6 +91,26 @@ CORE_C_DEFS := \
 GNW_CORE_SDK ?= sdk
 BUILD_DIR ?= build/$(PROJECT_KIND)
 
+# PROF=1: the device profiler (src/porting/neo_prof.c): PROF/ lines every
+# 120 frames in the log. The objects do not depend on the defines and
+# BUILD_DIR must stay build/core (the linker script's paths), so a switch
+# of PROF needs a clean build/core first: the stamp below stops the build
+# if it was built the other way.
+PROF ?= 0
+ifeq ($(PROF),1)
+CORE_C_DEFS += -DNEO_PROF
+endif
+NEO_PROF_STAMP := $(BUILD_DIR)/.neo_prof
+ifeq ($(filter clean host decrypt-zip docker docker_pull docker_shell,$(MAKECMDGOALS)),)
+NEO_PROF_PREV := $(shell cat $(NEO_PROF_STAMP) 2>/dev/null)
+ifneq ($(NEO_PROF_PREV),)
+ifneq ($(NEO_PROF_PREV),$(PROF))
+$(error $(BUILD_DIR) was built with PROF=$(NEO_PROF_PREV): make clean first, then PROF=$(PROF))
+endif
+endif
+$(shell mkdir -p $(BUILD_DIR) && echo $(PROF) > $(NEO_PROF_STAMP))
+endif
+
 ifeq ($(PROJECT_KIND),core)
 CORE_C_DEFS += \
 -DPROJECT_KIND_CORE=1 \
@@ -104,6 +128,14 @@ endif
 OPT ?= -Os
 
 include $(GNW_CORE_SDK)/Makefile
+
+# The 68000 interpreter at -O2 (gw-arcade-core catalogue §15a: -17..-18%
+# of the 68000's device cycles on two unrelated boards, "a property of the
+# core"). Everything else stays -Os: the blanket -Os is for the objects
+# that fill the 64K ITCM, and m68kcpu.o runs from RAM_EMU. Cost: ~+47K of
+# RAM_EMU code. A change of this flag does not rebuild the object by itself:
+# delete build/core/m68kcpu.o (or make clean).
+$(BUILD_DIR)/m68kcpu.o: OPT = -O2
 
 PACK_CORE := $(GNW_CORE_SDK)/tools/pack_core.py
 CORE_VERSION ?= $(shell git describe --tags --dirty 2>/dev/null || echo NOTAG)
@@ -169,7 +201,7 @@ DOCKER_RUN := docker run --rm $(DOCKER_TTY_FLAG) \
 
 docker:
 	$(V)$(ECHO) "[ DOCKER ]" $(DOCKER_IMAGE) "PROJECT_KIND=$(PROJECT_KIND)"
-	$(V)$(DOCKER_RUN) make --no-print-directory -j$$(nproc) PROJECT_KIND=$(PROJECT_KIND)
+	$(V)$(DOCKER_RUN) make --no-print-directory -j$$(nproc) PROJECT_KIND=$(PROJECT_KIND) PROF=$(PROF)
 
 docker_pull:
 	$(V)$(ECHO) "[ PULL ]" $(DOCKER_IMAGE)

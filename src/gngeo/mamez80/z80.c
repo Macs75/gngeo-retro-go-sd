@@ -4265,19 +4265,331 @@ void z80_exit(void)
 #ifdef Z80_MSX
 int z80_msx_execute(int cycles)
 #else
+#ifdef NEO_PROF
+unsigned int neo_z80_icount;     /* instructions executed (PROF/cpi) */
+#endif
+
+/****************************************************************************
+ * Z80 idle-loop skip (gngeo port, NEO_Z80_IDLE).
+ *
+ * Neo Geo sound drivers spend most of their time polling Z80 RAM for the
+ * next command or timer tick (neodrift: EI / LD A,($FEB1) / LD B,A /
+ * LD A,($FEB0) / CP B / JR Z, 90% of the Z80's time). This core runs the
+ * Z80 in NEO_Z80_SLICES slices per frame and raises its interrupts only
+ * between slices (the YM2610 timers in my_timer, the 68000's command NMI
+ * after the Z80's slices): within a slice nothing outside the Z80 changes
+ * what such a loop reads.
+ *
+ *  - ARM (neo_z80i_slice_end, after each slice, cold): the slice ends
+ *    inside the wait loop; decode forward from the PC to the backward
+ *    JR/JP/DJNZ that closes it. Every instruction of the loop must be on
+ *    the WHITELIST (z80i_len): register and memory reads, ALU, compares,
+ *    BIT, INC/DEC of registers, branches, EI/DI/NOP -- no memory store, no
+ *    IN/OUT, no CALL/RET/PUSH/POP, so a pass has no effect outside the
+ *    Z80's registers.
+ *  - TRIAL (neo_z80i_trial, cold): the real core runs one pass from the
+ *    head on a saved copy of its state, which is then put back. It gives
+ *    the pass's exact cost in T-states and its R advance, and whether the
+ *    pass is a FIXED POINT (every register as it was, R aside).
+ *  - SKIP (neo_z80i_hit, hot, a PC compare in z80_execute): when the head
+ *    comes round exactly one pass after the last time and a trial pass is
+ *    a fixed point, all but the last of the whole passes left in the
+ *    slice are consumed at once: the T-states, and R by the instructions
+ *    they would have fetched. The last pass and the slice's tail run for
+ *    real. MAME's own BUSY_LOOP_HACKS (JP to itself) are left alone.
+ * Exact: the machine ends the slice as the core alone leaves it (REC/hash
+ * of replays, skip on and off). Host: NEO_NOZ80IDLE=1 off, NEO_Z80IDLEBUG=1
+ * charges each skipped pass one T-state short (the control),
+ * NEO_Z80IDLE_LOG=1 logs arms and rejects.
+ ****************************************************************************/
+#ifndef NEO_Z80_IDLE
+#define NEO_Z80_IDLE 1
+#endif
+#if NEO_Z80_IDLE
+#define Z80I_COLD __attribute__((section(".neo_flash.z80idle"), noinline))
+#define Z80I_NONE 0xffffffffu
+unsigned int neo_z80i_head = Z80I_NONE;
+unsigned int neo_z80i_skipped, neo_z80i_skips, neo_z80i_arms, neo_z80i_rejects;
+static int z80i_lap, z80i_last, z80i_rinc, z80i_fails, z80i_bug, z80i_off = -1, z80i_log;
+static unsigned int z80i_rej[8], z80i_rej_n;
+
+/* the length of the whitelisted instruction at pc (0: not allowed);
+ * *target: a branch's destination, *uncond: JR/JP always taken */
+static Z80I_COLD int z80i_len(unsigned pc, unsigned *target, int *uncond)
+{
+	unsigned op = RM(pc), b1 = RM((pc + 1) & 0xffff), b2 = RM((pc + 2) & 0xffff);
+	*target = Z80I_NONE; *uncond = 0;
+	switch (op) {
+	case 0x00: case 0xfb: case 0xf3:                              /* NOP EI DI */
+	case 0x0a: case 0x1a:                                         /* LD A,(BC) (DE) */
+	case 0x07: case 0x0f: case 0x17: case 0x1f: case 0x2f: case 0x37: case 0x3f:
+	case 0x03: case 0x13: case 0x23: case 0x33: case 0x0b: case 0x1b: case 0x2b: case 0x3b:
+	case 0x09: case 0x19: case 0x29: case 0x39:
+		return 1;
+	case 0x06: case 0x0e: case 0x16: case 0x1e: case 0x26: case 0x2e: case 0x3e:   /* LD r,n */
+	case 0xc6: case 0xce: case 0xd6: case 0xde: case 0xe6: case 0xee: case 0xf6: case 0xfe:
+		return 2;
+	case 0x18: case 0x20: case 0x28: case 0x30: case 0x38: case 0x10:             /* JR, DJNZ */
+		*target = (pc + 2 + (unsigned)(int)(INT8)b1) & 0xffff;
+		*uncond = op == 0x18;
+		return 2;
+	case 0x3a: case 0x2a: case 0x01: case 0x11: case 0x21: case 0x31:              /* LD A,(nn) ... */
+		return 3;
+	case 0xc3: case 0xc2: case 0xca: case 0xd2: case 0xda: case 0xe2: case 0xea: case 0xf2: case 0xfa:
+		*target = b1 | (b2 << 8);
+		*uncond = op == 0xc3;
+		return 3;
+	case 0xcb:                                                    /* rotates on r, BIT */
+		if (b1 >= 0x80) return 0;                                 /* RES/SET */
+		if (b1 < 0x40 && (b1 & 7) == 6) return 0;                 /* rotate (HL): a store */
+		return 2;
+	case 0xed:
+		if (b1 == 0x4b || b1 == 0x5b || b1 == 0x6b || b1 == 0x7b) return 4;      /* LD rr,(nn) */
+		return 0;
+	case 0xdd: case 0xfd:
+		if (b1 == 0x46 || b1 == 0x4e || b1 == 0x56 || b1 == 0x5e || b1 == 0x66 || b1 == 0x6e ||
+		    b1 == 0x7e || b1 == 0x86 || b1 == 0x8e || b1 == 0x96 || b1 == 0x9e || b1 == 0xa6 ||
+		    b1 == 0xae || b1 == 0xb6 || b1 == 0xbe)
+			return 3;                                             /* LD r,(IX+d), ALU (IX+d) */
+		if (b1 == 0x21 || b1 == 0x2a) return 4;                   /* LD IX,nn / (nn) */
+		if (b1 == 0xcb && (RM((pc + 3) & 0xffff) & 0xc0) == 0x40) return 4;   /* BIT b,(IX+d) */
+		return 0;
+	}
+	if (op >= 0x40 && op <= 0x7f)                                 /* LD r,r' / LD r,(HL) */
+		return (op == 0x76 || (op >= 0x70 && op <= 0x77)) ? 0 : 1;   /* not HALT, not LD (HL),r */
+	if (op >= 0x80 && op <= 0xbf)                                 /* ALU A,r / (HL) */
+		return 1;
+	if ((op & 0xc6) == 0x04 && op != 0x34 && op != 0x35)          /* INC r / DEC r, not (HL) */
+		return 1;
+	return 0;
+}
+
+/* one pass from the head on the real core, its state put back after.
+ * 0: no whitelisted pass back to the head; 1: a pass that changes the
+ * registers; 2: a fixed point. *lap its T-states, *rinc its R advance. */
+static Z80I_COLD int neo_z80i_trial(int *lap, int *rinc)
+{
+	Z80_Regs save = Z80, cmp;
+	int ic0 = Z80_ICOUNT, n, ok = 0, fixed = 0;
+	unsigned head = _PCD & 0xffff, t;
+	int u;
+	UINT8 r0 = _R;
+
+	for (n = 0; n < 24; n++) {
+		unsigned op = RM(_PCD);
+		if (!z80i_len(_PCD & 0xffff, &t, &u))
+			break;
+		if (op == 0xfb && !_IFF1)          /* EI that would run the next instruction itself */
+			break;
+		_PPC = _PCD;
+		_R++;
+		EXEC_INLINE(op, ROP());
+		if ((_PCD & 0xffff) == head) { ok = 1; break; }
+	}
+	*lap = ic0 - Z80_ICOUNT;
+	*rinc = (UINT8)(_R - r0);
+	if (ok && *lap > 0 && *lap < 1000) {
+		cmp = Z80;
+		cmp.R = save.R;
+		fixed = memcmp(&cmp, &save, sizeof(save)) == 0;
+	} else
+		ok = 0;
+	Z80 = save;
+	Z80_ICOUNT = ic0;
+	return !ok ? 0 : fixed ? 2 : 1;
+}
+
+static Z80I_COLD void z80i_reject(unsigned pc, const char *why)
+{
+	z80i_rej[z80i_rej_n++ & 7] = pc;
+	neo_z80i_rejects++;
+#ifdef HOST_BUILD
+	if (z80i_log) printf("Z80IDLE: no skip at %04x (%s)\n", pc, why);
+#else
+	(void)why;
+#endif
+}
+
+/* after each slice: arm the loop it ended in */
+static Z80I_COLD void neo_z80i_slice_end(void)
+{
+	unsigned pc = _PCD & 0xffff, p = pc, t, i;
+	int len, u;
+#ifdef HOST_BUILD
+	if (z80i_off < 0) {
+		z80i_off = getenv("NEO_NOZ80IDLE") != NULL;
+		z80i_bug = getenv("NEO_Z80IDLEBUG") != NULL;
+		z80i_log = getenv("NEO_Z80IDLE_LOG") != NULL;
+	}
+#else
+	z80i_off = 0;
+#endif
+	if (z80i_off)
+		return;
+	if (neo_z80i_head != Z80I_NONE && pc >= neo_z80i_head && pc < neo_z80i_head + 64)
+		return;
+	for (i = 0; i < 8; i++)
+		if (z80i_rej[i] == pc) return;
+	for (i = 0; i < 16; i++) {
+		len = z80i_len(p, &t, &u);
+		if (!len) { z80i_reject(pc, "an instruction outside the whitelist"); return; }
+		if (t != Z80I_NONE && t <= pc && pc - t <= 64) {
+			unsigned q = t;                    /* the whole loop must be whitelisted */
+			while (q < p + len) {
+				unsigned t2; int u2, l2 = z80i_len(q, &t2, &u2);
+				if (!l2) { z80i_reject(pc, "an instruction outside the whitelist"); return; }
+				q += l2;
+			}
+			if (q != p + len) { z80i_reject(pc, "misaligned"); return; }
+			if (t == p) { z80i_reject(pc, "a branch to itself (MAME's busy-loop hack)"); return; }
+			neo_z80i_head = t;
+			z80i_lap = 0; z80i_last = 0; z80i_fails = 0;
+			neo_z80i_arms++;
+#ifdef HOST_BUILD
+			if (z80i_log) printf("Z80IDLE: armed head %04x (slice end at %04x)\n", t, pc);
+#endif
+			return;
+		}
+		if (u) { z80i_reject(pc, "a jump before the loop closes"); return; }
+		p = (p + len) & 0xffff;
+	}
+	z80i_reject(pc, "no backward branch in 16 instructions");
+}
+
+/* The hot code below runs from ITCM (z80.o's .text); the cold functions
+ * above are linked at 0xCAFE... and moved to flash at boot, when
+ * neo_flash_ro.c rewrites the 0xCAFE... words of RAM_EMU -- not those of
+ * ITCM. A direct call would go through a linker veneer placed in ITCM,
+ * left pointing at 0xCAFE...: a hard fault. So the hot code calls them
+ * through these pointers, which live in RAM_EMU (.data) and are
+ * rewritten. */
+static int (* volatile z80i_trial_fp)(int *, int *) = neo_z80i_trial;   /* volatile: GCC must */
+static void (* volatile z80i_slice_end_fp)(void) = neo_z80i_slice_end;    /* load it, not call direct */
+
+/* the head reached (hot) */
+static void neo_z80i_hit(void)
+{
+	int ic = Z80_ICOUNT, d, laps, lap2, r2, k;
+	if (z80i_lap == 0) {
+		k = z80i_trial_fp(&lap2, &r2);
+		if (k) { z80i_lap = lap2; z80i_rinc = r2; }
+		else if (++z80i_fails >= 8) {        /* no pass from the head: drop it */
+			z80i_rej[z80i_rej_n++ & 7] = neo_z80i_head;
+			neo_z80i_rejects++;
+			neo_z80i_head = Z80I_NONE;
+		}
+		z80i_last = ic;
+		return;
+	}
+	d = z80i_last - ic;
+	z80i_last = ic;
+	if (d != z80i_lap)
+		return;
+	laps = ic / d;
+	if (laps < 2)
+		return;
+	if (z80i_trial_fp(&lap2, &r2) != 2 || lap2 != d)
+		return;
+	laps--;
+	Z80_ICOUNT -= laps * (d - z80i_bug);
+	_R += (UINT8)(laps * z80i_rinc);
+	z80i_last = Z80_ICOUNT;
+	neo_z80i_skipped += (unsigned)(laps * d);
+	neo_z80i_skips++;
+}
+
+void neo_z80i_reset(void)
+{
+	neo_z80i_head = Z80I_NONE;
+	z80i_lap = 0; z80i_rej_n = 0;
+	memset(z80i_rej, 0xff, sizeof(z80i_rej));
+}
+#endif
+
+#ifdef HOST_BUILD
+/* host: [0, 0x10000) T-states, [0x10000, 0x20000) instructions per PC,
+ * printed at exit (neo_z80hist_dump) */
+unsigned int *neo_z80hist;
+static void neo_z80hist_dump(void)
+{
+	unsigned long long tc = 0, ti = 0;
+	unsigned int i, k;
+	for (i = 0; i < 0x10000; i++) { tc += neo_z80hist[i]; ti += neo_z80hist[0x10000 + i]; }
+	printf("Z80HIST: T-states total=%llu instructions total=%llu\n", tc, ti);
+	for (k = 0; k < 20; k++) {
+		unsigned int best = 0, bi = 0;
+		for (i = 0; i < 0x10000; i++)
+			if (neo_z80hist[0x10000 + i] > best) { best = neo_z80hist[0x10000 + i]; bi = i; }
+		if (!best) break;
+		printf("Z80HIST: %04x ins=%10u %5.2f%%  T=%10u %5.2f%%  %02x %02x %02x %02x\n", bi, best,
+		       ti ? 100.0 * best / ti : 0.0, neo_z80hist[bi], tc ? 100.0 * neo_z80hist[bi] / tc : 0.0,
+		       RM(bi), RM((bi + 1) & 0xffff), RM((bi + 2) & 0xffff), RM((bi + 3) & 0xffff));
+		neo_z80hist[0x10000 + bi] = 0;
+	}
+	for (k = 0; k < 8; k++) {		/* by T-states (burned busy loops show here) */
+		unsigned int best = 0, bi = 0;
+		for (i = 0; i < 0x10000; i++)
+			if (neo_z80hist[i] > best) { best = neo_z80hist[i]; bi = i; }
+		if (!best) break;
+		printf("Z80HIST/T: %04x T=%10u %5.2f%%  %02x %02x %02x %02x\n", bi, best,
+		       tc ? 100.0 * best / tc : 0.0, RM(bi), RM((bi + 1) & 0xffff), RM((bi + 2) & 0xffff), RM((bi + 3) & 0xffff));
+		neo_z80hist[bi] = 0;
+	}
+}
+#endif
+
 int z80_execute(int cycles)
 #endif
 {
+#ifdef HOST_BUILD
+	{
+		static int init;
+		if (!init) {
+			init = 1;
+			if (getenv("NEO_Z80HIST")) {
+				neo_z80hist = calloc(0x20000, sizeof(*neo_z80hist));
+				if (neo_z80hist) atexit(neo_z80hist_dump);
+			}
+		}
+	}
+#endif
 	Z80_ICOUNT = cycles - Z80.extra_cycles;
 	Z80.extra_cycles = 0;
+#ifdef NEO_PROF
+	unsigned int icount = 0;          /* PROF/cpi: device cycles per instruction */
+#endif
 
 	do
 	{
+#ifdef NEO_PROF
+		icount++;
+#endif
+#if NEO_Z80_IDLE
+		if (_PCD == neo_z80i_head)
+			neo_z80i_hit();
+#endif
 		_PPC = _PCD;
 		//CALL_MAME_DEBUG;
 		_R++;
+#ifdef HOST_BUILD
+		{	/* NEO_Z80HIST=1 (host): Z80 T-states and instructions per PC */
+			int hist_c0 = Z80_ICOUNT; unsigned hist_pc = _PCD & 0xffff;
+			EXEC_INLINE(op,ROP());
+			if (neo_z80hist) {
+				neo_z80hist[hist_pc] += (unsigned)(hist_c0 - Z80_ICOUNT);
+				neo_z80hist[0x10000 + hist_pc]++;
+			}
+		}
+#else
 		EXEC_INLINE(op,ROP());
+#endif
 	} while( Z80_ICOUNT > 0 );
+#ifdef NEO_PROF
+	neo_z80_icount += icount;
+#endif
+#if NEO_Z80_IDLE
+	z80i_slice_end_fp();
+#endif
 
 	Z80_ICOUNT -= Z80.extra_cycles;
 	Z80.extra_cycles = 0;

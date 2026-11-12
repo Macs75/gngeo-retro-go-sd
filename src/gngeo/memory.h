@@ -121,7 +121,7 @@ extern neo_mem memory;
 /* video related */
 //extern int irq2start, irq2control;
 extern Uint8 *current_pal;
-extern Uint32 *current_pc_pal;
+extern Uint16 *current_pc_pal;
 extern Uint8 *current_fix;
 extern Uint8 *fix_usage;
 

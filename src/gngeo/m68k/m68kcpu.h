@@ -534,14 +534,14 @@ void gwenesis_m68k_load_state(FILE *file, int ss_version);
 
 /* ----------------------------- Read / Write ----------------------------- */
 
-/* Read data immediately following the PC.
- * NULL read16/read8 → direct base[] (Neo Geo LE: words native, bytes XOR1). */
-#define m68k_read_immediate_16(address) ( \
+/* A 16-bit read through the page map: NULL read16/read8 → direct base[]
+ * (Neo Geo LE: words native, bytes XOR1), else the page's handler. */
+#define m68k_read_mapped_16(address) ( \
   m68ki_cpu.memory_map[((address)>>16)&0xff].read16 \
     ? (*m68ki_cpu.memory_map[((address)>>16)&0xff].read16)(ADDRESS_68K(address)) \
     : (unsigned int)*(uint16 *)(m68ki_cpu.memory_map[((address)>>16)&0xff].base + ((address) & 0xffff)) )
 
-#define m68k_read_immediate_32(address) ( \
+#define m68k_read_mapped_32(address) ( \
   (unsigned int)( \
     (m68ki_cpu.memory_map[((address)>>16)&0xff].read16 \
       ? (*m68ki_cpu.memory_map[((address)>>16)&0xff].read16)(ADDRESS_68K(address)) \
@@ -556,8 +556,38 @@ void gwenesis_m68k_load_state(FILE *file, int ss_version);
     ? (*m68ki_cpu.memory_map[((address)>>16)&0xff].read8)(ADDRESS_68K(address)) \
     : (unsigned int)m68ki_cpu.memory_map[((address)>>16)&0xff].base[((address) ^ 1) & 0xffff] )
 
-#define m68k_read_pcrelative_16(address) m68k_read_immediate_16(address)
-#define m68k_read_pcrelative_32(address) m68k_read_immediate_32(address)
+#define m68k_read_pcrelative_16(address) m68k_read_mapped_16(address)
+#define m68k_read_pcrelative_32(address) m68k_read_mapped_32(address)
+
+/* Read data immediately following the PC (the opcode and its extension
+ * words) through a cached page: the page-table lookup and the handler
+ * test of m68k_read_mapped_16 become one compare, which fails only when
+ * the PC changes 64K page (gw-arcade-core's fetch-page cache, catalogue
+ * §42; page and base side by side in one struct, the change unlikely).
+ * m68k_fetch16_miss (m68kcpu.c) fills it: a direct page, or page 0, whose
+ * handler only overlays the vector table at $000000-$00007F, data the CPU
+ * never executes (PC-relative reads keep m68k_read_mapped_*, overlay and
+ * all); a page with a handler stays uncached. m68k_fetch_invalidate():
+ * after any change to the page map (bank switch, map set-up), and at
+ * every m68k_run. */
+struct m68k_fetch_cache { unsigned int page; unsigned char *base; };
+extern struct m68k_fetch_cache m68k_fc;
+extern unsigned char *m68k_fetch_page0_base;
+unsigned int m68k_fetch16_miss(unsigned int address);
+void m68k_fetch_invalidate(void);
+/* GCC: at -Os it kept this out of line (a tail call from every fetch, one
+ * branch MORE than the map test it replaces): forced inline. m68kcpu.o is
+ * now built at -O2 (Makefile), where GCC inlines it anyway; the attribute
+ * keeps it so if the flag ever goes back. */
+static inline __attribute__((always_inline)) unsigned int m68ki_fetch16(unsigned int address)
+{
+  if (__builtin_expect(((address >> 16) & 0xff) != m68k_fc.page, 0))
+    return m68k_fetch16_miss(address);
+  return *(uint16 *)(m68k_fc.base + (address & 0xffff));
+}
+#define m68k_read_immediate_16(address) m68ki_fetch16(address)
+#define m68k_read_immediate_32(address) \
+  ((m68ki_fetch16(address) << 16) | m68ki_fetch16((address) + 2))
 
 /* map read immediate 8 to read immediate 16 */
 #define m68ki_read_imm_8() MASK_OUT_ABOVE_8(m68ki_read_imm_16())
@@ -827,6 +857,17 @@ INLINE uint m68ki_read_imm_16(void)
 #endif /* M68K_EMULATE_PREFETCH */
 }
 
+/* the OPCODE fetch, for m68k_run's one call site. GCC: forced inline;
+ * m68ki_read_imm_16 (every extension word) stays one shared function --
+ * the cached fetch inlined at every one of those sites would cost several K
+ * of RAM code (gw-arcade-core measured ~5K). */
+static inline __attribute__((always_inline)) uint m68ki_read_opcode_16(void)
+{
+  uint pc = REG_PC;
+  REG_PC += 2;
+  return m68ki_fetch16(pc);
+}
+
 INLINE uint m68ki_read_imm_32(void)
 {
 #if M68K_EMULATE_PREFETCH
@@ -921,11 +962,11 @@ INLINE uint m68ki_read_32(uint address)
 
   temp = &m68ki_cpu.memory_map[((address)>>16)&0xff];
   if (temp->read16) val = (*temp->read16)(ADDRESS_68K(address)) << 16;
-  else val = m68k_read_immediate_16(address) << 16;
+  else val = m68k_read_mapped_16(address) << 16;
 
   temp = &m68ki_cpu.memory_map[((address+2)>>16)&0xff];
   if (temp->read16) val |= (*temp->read16)(ADDRESS_68K(address+2));
-  else val |= m68k_read_immediate_16(address+2);
+  else val |= m68k_read_mapped_16(address+2);
 
 #ifdef HOOK_CPU
   if (cpu_hook)

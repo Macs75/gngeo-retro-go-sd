@@ -140,8 +140,7 @@ void neogeo_reset(void);
 #define PROFILER_STOP profiler_stop
 
 #else
-#define PROFILER_START(a)
-#define PROFILER_STOP(a)
+#include "profiler.h"   /* the port's probes: no-ops unless NEO_PROF */
 #endif
 
 
