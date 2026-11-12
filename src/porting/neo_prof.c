@@ -9,6 +9,11 @@
  *                                           work (everything but the two
  *                                           sleeps), the worst single frame's
  *   PROF/emu: z80 m68k irq audio(ym) framectl, per frame (paid every frame)
+ *   PROF/vsplit: draw_screen's clear, sprites and fix layer per drawn frame
+ *   PROF/tiles: sprite tiles drawn per drawn frame by path (video.c)
+ *   PROF/ym: the YM2610 loop, clean and instrumented cost per call and the
+ *            split (eg fm ssg adpcmb adpcma mix), see ym2610.c
+ *   PROF/cpi: device cycles per emulated 68000 and Z80 instruction
  *   PROF/video: draw present, per DRAWN frame; wait vwait per frame
  *
  * Every figure is cycles of the core clock. busy / budget is the share of
@@ -98,6 +103,39 @@ void neo_prof_frame_end(int was_drawn, int was_fw_skip, int was_vskip)
            (unsigned long)(ph[NEO_PH_VIDEO] / d), (unsigned long)(ph[NEO_PH_PRESENT] / d),
            (unsigned long)(ph[NEO_PH_WAIT] / n), (unsigned long)(ph[NEO_PH_VWAIT] / n));
 
+    {
+        /* draw_screen's parts per drawn frame (video.c): clear (the DMA2D
+         * fill and its wait), sprites (list + tiles), fix layer */
+        extern unsigned int neo_vid_part[3], neo_vid_frames;
+        uint32_t f = neo_vid_frames ? neo_vid_frames : 1u;
+        printf("PROF/vsplit: clear=%lu sprites=%lu fix=%lu per drawn frame\n",
+               (unsigned long)(neo_vid_part[0] / f), (unsigned long)(neo_vid_part[1] / f),
+               (unsigned long)(neo_vid_part[2] / f));
+        extern unsigned int neo_tile_cnt[4];
+        printf("PROF/tiles: full=%lu yzoom=%lu narrow=%lu clipped=%lu per drawn frame\n",
+               (unsigned long)(neo_tile_cnt[0] / f), (unsigned long)(neo_tile_cnt[1] / f),
+               (unsigned long)(neo_tile_cnt[2] / f), (unsigned long)(neo_tile_cnt[3] / f));
+        for (int i = 0; i < 4; i++)
+            neo_tile_cnt[i] = 0;
+        neo_vid_part[0] = neo_vid_part[1] = neo_vid_part[2] = neo_vid_frames = 0;
+    }
+    {
+        /* the YM2610's sample loop (ym2610.c): every other call instrumented.
+         * clean = cycles per uninstrumented call, instr = per instrumented
+         * call (their difference is the counters' own price), then the
+         * instrumented calls' loop split per call */
+        extern unsigned int neo_ym_part[6], neo_ym_tot[2], neo_ym_calls[2];
+        uint32_t c0 = neo_ym_calls[0] ? neo_ym_calls[0] : 1u, c1 = neo_ym_calls[1] ? neo_ym_calls[1] : 1u;
+        printf("PROF/ym: clean=%lu instr=%lu per call (%lu+%lu calls) eg=%lu fm=%lu ssg=%lu adpcmb=%lu adpcma=%lu mix=%lu\n",
+               (unsigned long)(neo_ym_tot[0] / c0), (unsigned long)(neo_ym_tot[1] / c1),
+               (unsigned long)neo_ym_calls[0], (unsigned long)neo_ym_calls[1],
+               (unsigned long)(neo_ym_part[0] / c1), (unsigned long)(neo_ym_part[1] / c1),
+               (unsigned long)(neo_ym_part[2] / c1), (unsigned long)(neo_ym_part[3] / c1),
+               (unsigned long)(neo_ym_part[4] / c1), (unsigned long)(neo_ym_part[5] / c1));
+        for (int i = 0; i < 6; i++)
+            neo_ym_part[i] = 0;
+        neo_ym_tot[0] = neo_ym_tot[1] = neo_ym_calls[0] = neo_ym_calls[1] = 0;
+    }
     {
         /* device cycles per emulated instruction (gw-arcade-core's
          * M68K_ICOUNT): the 68000 phase without the idle skip's own work

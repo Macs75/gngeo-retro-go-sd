@@ -4075,10 +4075,17 @@ static void take_interrupt(void)
 /****************************************************************************
  * Processor initialization
  ****************************************************************************/
-#ifdef Z80_MSX
-void z80_msx_init(void)
+/* init/reset-only code of an ITCM object: out of the 64K ITCM, into RAM
+ * (ld/neogeo_core.ld .ram_cold). Its callers all run from RAM. */
+#ifdef HOST_BUILD
+#define NEO_RAM_COLD
 #else
-void z80_init(void)
+#define NEO_RAM_COLD __attribute__((section(".ram_cold"), noinline))
+#endif
+#ifdef Z80_MSX
+NEO_RAM_COLD void z80_msx_init(void)
+#else
+NEO_RAM_COLD void z80_init(void)
 #endif
 {
   /* --- MP ---
@@ -4214,9 +4221,9 @@ void z80_init(void)
  * Reset registers to their initial values
  ****************************************************************************/
 #ifdef Z80_MSX
-void z80_msx_reset(void *param)
+NEO_RAM_COLD void z80_msx_reset(void *param)
 #else
-void z80_reset(void *param)
+NEO_RAM_COLD void z80_reset(void *param)
 #endif
 {
 	Z80_DaisyChain *daisy_chain = (Z80_DaisyChain *)param;
@@ -4498,7 +4505,7 @@ static void neo_z80i_hit(void)
 	neo_z80i_skips++;
 }
 
-void neo_z80i_reset(void)
+NEO_RAM_COLD void neo_z80i_reset(void)
 {
 	neo_z80i_head = Z80I_NONE;
 	z80i_lap = 0; z80i_rej_n = 0;

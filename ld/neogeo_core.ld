@@ -73,6 +73,9 @@ SECTIONS
     /* the 68000 idle skip's pass runner (neo_idle.c run_in_place and its
      * helpers): hot, in RAM; the rest of neo_idle.o is cold, in flash */
     build/core/neo_idle.o(.ram_idle)
+    /* init/reset-only functions of the ITCM objects (z80.o, ym2610.o):
+     * NEO_RAM_COLD, out of the 64K ITCM, in RAM (called from RAM code) */
+    *(.ram_cold)
 
     /* Keep bridge / hot .rodata here; cold .rodata → .neo_flash. */
     EXCLUDE_FILE(

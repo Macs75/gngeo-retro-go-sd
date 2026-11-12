@@ -1122,6 +1122,22 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 	i = 4; /* four operators per channel */
 	do {
 		switch (SLOT->state) {
+		case EG_OFF:
+			/* Off and no SSG-EG: vol_out = tl + volume is constant within
+			 * an update call (tl changes by register writes, between
+			 * calls; an off slot's volume does not move) and was set at
+			 * the call's first tick (eg_off_set) or by the tick that
+			 * switched the slot off. ssgn still takes the swap flag an
+			 * earlier slot of this channel may have set (MAME carries it
+			 * to the following slots). With SSG-EG the negate follows
+			 * ssgn, so such a slot takes the full path below. */
+			if (!(SLOT->ssg & 0x08)) {
+				SLOT->ssgn ^= swap_flag;
+				SLOT++;
+				i--;
+				continue;
+			}
+			break;
 		case EG_ATT: /* attack phase */
 			if (!(OPN->eg_cnt & ((1 << SLOT->eg_sh_ar) - 1))) {
 				SLOT->volume += (~SLOT->volume
@@ -1231,6 +1247,32 @@ INLINE void advance_eg_channel(FM_OPN *OPN, FM_SLOT *SLOT) {
 		i--;
 	} while (i);
 
+}
+
+/* Whether a channel's envelope can change in an update call: not when all
+ * four slots are off without SSG-EG (no key-on inside the loop, and with
+ * every slot off no swap flag is set). */
+INLINE int eg_chan_moves(const FM_CH *CH)
+{
+	const FM_SLOT *SLOT = &CH->SLOT[SLOT1];
+	int i;
+	for (i = 0; i < 4; i++, SLOT++)
+		if (SLOT->state != EG_OFF || (SLOT->ssg & 0x08))
+			return 1;
+	return 0;
+}
+
+/* At an update call's FIRST envelope tick: the output of the slots that are
+ * off without SSG-EG, exactly what that tick would compute for them; the
+ * ticks then skip them (advance_eg_channel's EG_OFF case) and the value
+ * holds for the rest of the call. */
+INLINE void eg_off_set(FM_CH *CH)
+{
+	FM_SLOT *SLOT = &CH->SLOT[SLOT1];
+	int i;
+	for (i = 0; i < 4; i++, SLOT++)
+		if (SLOT->state == EG_OFF && !(SLOT->ssg & 0x08))
+			SLOT->vol_out = SLOT->tl + ((u32) SLOT->volume);
 }
 
 #define volume_calc(OP) ((OP)->vol_out + (AM & (OP)->AMmask))
@@ -1485,7 +1527,15 @@ static double ym_sin(double x)
 }
 #endif
 
-static void OPNInitTable(void)
+/* init/reset-only code of an ITCM object: out of the 64K ITCM, into RAM
+ * (ld/neogeo_core.ld .ram_cold). Its callers all run from RAM. */
+#ifdef HOST_BUILD
+#define NEO_RAM_COLD
+#else
+#define NEO_RAM_COLD __attribute__((section(".ram_cold"), noinline))
+#endif
+
+static NEO_RAM_COLD void OPNInitTable(void)
 {
 	signed int i, x;
 	signed int n;
@@ -1561,7 +1611,7 @@ static void OPNInitTable(void)
 	ym_tables_ready = 1;
 }
 
-int YM2610_prepare_tables(void)
+NEO_RAM_COLD int YM2610_prepare_tables(void)
 {
 	OPNInitTable();
 	return (ym_tables_ready && tl_tab && sin_tab) ? 1 : 0;
@@ -1578,7 +1628,7 @@ int YM2610_prepare_tables(void)
 }
 
 /* prescaler set (and make time tables) */
-static void OPNSetPres(FM_OPN *OPN, int pres, int TimerPres, int SSGpres) {
+static NEO_RAM_COLD void OPNSetPres(FM_OPN *OPN, int pres, int TimerPres, int SSGpres) {
 	int i;
 
 	/* frequency base */
@@ -2245,6 +2295,106 @@ static inline int jedi_lookup(int step16_plus_nib)
 	*ch->pan += ch->adpcma_out;
 }
 
+/* ADPCM-A over a whole update call, channel by channel: each playing
+ * channel's state stays in registers for the call, and its output goes
+ * into the speaker sums adpcma_l / adpcma_r, which the sample loop adds
+ * (left = LEFT + CENTER channels, right = RIGHT + CENTER, as out_adpcma
+ * gave). The same arithmetic as OPNB_ADPCMA_calc_chan per sample, and the
+ * channels are independent within a call (a channel only stops itself;
+ * flags, pans and volumes change by register writes, between calls), so
+ * the output is identical; integer sums do not depend on the order.
+ * Returns 0 when no channel plays (the buffers are then not touched). */
+#define YM_ADPCMA_MAX 512
+static s32 adpcma_l[YM_ADPCMA_MAX], adpcma_r[YM_ADPCMA_MAX];
+
+static int OPNB_ADPCMA_render(int length)
+{
+	int j, any = 0;
+
+	if (length > YM_ADPCMA_MAX)
+		length = YM_ADPCMA_MAX;
+	for (j = 0; j < 6; j++) {
+		ADPCMA *ch = &YM2610.adpcma[j];
+		s32 *bl = NULL, *br = NULL;
+		const u8 *rom = pcmbufA;
+		u32 now_step, step, now_addr, end;
+		s32 acc, astep, out;
+		u8 now_data;
+		int i, pan, ended = 0;
+
+		if (!ch->flag)
+			continue;
+		if (!any) {
+			memset(adpcma_l, 0, (size_t)length * sizeof(s32));
+			memset(adpcma_r, 0, (size_t)length * sizeof(s32));
+			any = 1;
+		}
+		pan = (int)(ch->pan - out_adpcma);
+		if (pan == OUTD_LEFT || pan == OUTD_CENTER)
+			bl = adpcma_l;
+		if (pan == OUTD_RIGHT || pan == OUTD_CENTER)
+			br = adpcma_r;
+
+		now_step = ch->now_step;
+		step = ch->step;
+		now_addr = ch->now_addr;
+		end = (ch->end << 1) & ((1 << 21) - 1);
+		now_data = ch->now_data;
+		acc = ch->adpcma_acc;
+		astep = ch->adpcma_step;
+		out = ch->adpcma_out;
+
+		for (i = 0; i < length; i++) {
+			now_step += step;
+			if (now_step >= (1 << ADPCM_SHIFT)) {
+				u32 n = now_step >> ADPCM_SHIFT;
+				u8 data;
+				now_step &= (1 << ADPCM_SHIFT) - 1;
+				do {
+					if ((now_addr & ((1 << 21) - 1)) >= end) {
+						ended = 1;
+						break;
+					}
+					if (now_addr & 1)
+						data = now_data & 0x0f;
+					else {
+						now_data = rom[now_addr >> 1];
+						data = (now_data >> 4) & 0x0f;
+					}
+					now_addr++;
+					acc += jedi_lookup(astep + data);
+					if (acc & 0x800)
+						acc |= ~0xfff;
+					else
+						acc &= 0xfff;
+					astep += step_inc[data & 7];
+					Limit(astep, 48*16, 0*16);
+				} while (--n);
+				if (ended)
+					break;
+				out = (((Sint16) acc * ch->vol_mul) >> ch->vol_shift) & ~3;
+			}
+			if (bl)
+				bl[i] += out;
+			if (br)
+				br[i] += out;
+		}
+
+		ch->now_step = now_step;
+		ch->now_addr = now_addr;
+		ch->now_data = now_data;
+		ch->adpcma_acc = acc;
+		ch->adpcma_step = astep;
+		ch->adpcma_out = out;
+		if (ended) {
+			ch->flag = 0;
+			ch->adpcma_out = 0;
+			YM2610.adpcm_arrivedEndAddress |= ch->flagMask;
+		}
+	}
+	return any;
+}
+
 /* ADPCM type A Write */
 static void OPNB_ADPCMA_write(int r, int v) {
 	ADPCMA *adpcma = YM2610.adpcma;
@@ -2656,7 +2806,7 @@ static int samples_left;
 static FM_TIMERHANDLER sav_TimerHandler;
 static FM_IRQHANDLER sav_IRQHandler;
 
-void YM2610Init(int clock, int rate, void *pcmroma, int pcmsizea, void *pcmromb,
+NEO_RAM_COLD void YM2610Init(int clock, int rate, void *pcmroma, int pcmsizea, void *pcmromb,
 		int pcmsizeb, FM_TIMERHANDLER TimerHandler, FM_IRQHANDLER IRQHandler) {
 	/*
 	 sound->stack    = 0x10000;
@@ -2712,7 +2862,7 @@ void YM2610ChangeSamplerate(int rate) {
 	YM2610.adpcmb.freqbase = YM2610.OPN.ST.freqbase;
 }
 /* reset one of chip */
-void YM2610Reset(void) {
+NEO_RAM_COLD void YM2610Reset(void) {
 	int i;
 	FM_OPN *OPN = &YM2610.OPN;
 
@@ -2945,6 +3095,33 @@ extern Uint16 *play_buffer;
 //static Uint32 buf_pos;
 
 /* Generate samples for one of the YM2610s */
+/* PROF build (device): where YM2610Update_stream's sample loop spends its
+ * time, PROF/ym (src/porting/neo_prof.c). Every OTHER call is instrumented
+ * (a cycle-counter read after each part of the loop): those calls give the
+ * split, the others the clean cost, and the two totals give the
+ * instrumentation's own price. Parts: eg (LFO, clears, envelope), fm (the
+ * four FM channels), ssg, adpcmb, adpcma (OPNB_ADPCMA_render, the whole
+ * call's ADPCM-A before the loop), mix (mix, clamp, store). */
+#if defined(NEO_PROF) && !defined(HOST_BUILD)
+unsigned int neo_ym_part[6], neo_ym_tot[2], neo_ym_calls[2];
+static unsigned int ymp_parity;
+#define YMP_NOW() (*(volatile unsigned int *)0xE0001004u)
+#define YMP_BEGIN() const unsigned int ymp = (ymp_parity ^= 1u); \
+	unsigned int ymp_c0 = YMP_NOW(), ymp_t = 0
+#define YMP_START() do { if (ymp) ymp_t = YMP_NOW(); } while (0)
+#define YMP_MARK(k) do { if (ymp) { unsigned int ymp_n = YMP_NOW(); \
+	neo_ym_part[k] += ymp_n - ymp_t; ymp_t = ymp_n; } } while (0)
+#define YMP_END() do { neo_ym_tot[ymp] += YMP_NOW() - ymp_c0; neo_ym_calls[ymp]++; } while (0)
+#define YMP_BLOCK(k, stmt) do { unsigned int ymp_b = YMP_NOW(); stmt; \
+	if (ymp) neo_ym_part[k] += YMP_NOW() - ymp_b; } while (0)
+#else
+#define YMP_BLOCK(k, stmt) do { stmt; } while (0)
+#define YMP_BEGIN() do { } while (0)
+#define YMP_START() do { } while (0)
+#define YMP_MARK(k) do { } while (0)
+#define YMP_END() do { } while (0)
+#endif
+
 void YM2610Update_stream(int length) {
 #if NEO_DISABLE_YM2610
 	(void)length;
@@ -2960,7 +3137,10 @@ void YM2610Update_stream(int length) {
 	int ssg_live;
 	int adpcm_a_live;
 	int adpcm_b_live;
+	int fm_live0, fm_live1, fm_live2, fm_live3;
 #endif
+	int eg_live0, eg_live1, eg_live2, eg_live3, eg_set = 0;
+	YMP_BEGIN();
 
 	//printf("AAA %d\n",length);
 	cch[0] = &YM2610.CH[1];
@@ -3004,19 +3184,33 @@ void YM2610Update_stream(int length) {
 
 	/* ADPCM-A/B: hoist idle check so quiet buffers skip clear+mix. */
 	adpcm_b_live = (YM2610.adpcmb.portstate & 0x80) != 0;
-	adpcm_a_live = 0;
-	for (j = 0; j < 6; j++) {
-		if (YM2610.adpcma[j].flag) {
-			adpcm_a_live = 1;
-			break;
-		}
-	}
+	/* ADPCM-A for the whole call at once, channel by channel, into
+	 * adpcma_l / adpcma_r (OPNB_ADPCMA_render); 0 when nothing plays */
+	YMP_BLOCK(4, adpcm_a_live = OPNB_ADPCMA_render(length));
+	/* FM channels with all four slots in EG_OFF: silent for the whole call.
+	 * EG_OFF holds the volume at MAX_ATT_INDEX, so every operator is under
+	 * ENV_QUIET and chan_calc adds nothing; the only way out is a key-on,
+	 * a register write, and none happens inside this loop (the timers run
+	 * outside it, FM_INTERNAL_TIMER 0). Tested once per call, not per
+	 * sample: per sample (seven loads a channel-sample) it cost more than
+	 * it saved whenever music plays (gw-arcade-core f5511ed: its YM2610
+	 * 864K -> 823K a frame). A channel that falls silent during the call
+	 * is still calculated, to no effect, until the next call. */
+	fm_live0 = fm_chan_alive(cch[0]);
+	fm_live1 = fm_chan_alive(cch[1]);
+	fm_live2 = fm_chan_alive(cch[2]);
+	fm_live3 = fm_chan_alive(cch[3]);
 #else
 	outn = SSG_calc_count(length);
 #endif
+	eg_live0 = eg_chan_moves(cch[0]);
+	eg_live1 = eg_chan_moves(cch[1]);
+	eg_live2 = eg_chan_moves(cch[2]);
+	eg_live3 = eg_chan_moves(cch[3]);
 
 	/* buffering */
 	for (i = 0; i < length; i++) {
+		YMP_START();
 
 #if NEO_YM_EARLYOUT
 		if (lfo_on)
@@ -3026,12 +3220,9 @@ void YM2610Update_stream(int length) {
 #endif
 
 #if NEO_YM_EARLYOUT
-		if (adpcm_a_live || adpcm_b_live) {
-			out_adpcma[OUTD_LEFT] = out_adpcma[OUTD_RIGHT] =
-					out_adpcma[OUTD_CENTER] = 0;
+		if (adpcm_b_live)
 			out_delta[OUTD_LEFT] = out_delta[OUTD_RIGHT] =
 					out_delta[OUTD_CENTER] = 0;
-		}
 #else
 		/* clear output acc. */
 		out_adpcma[OUTD_LEFT] = out_adpcma[OUTD_RIGHT] =
@@ -3058,22 +3249,35 @@ void YM2610Update_stream(int length) {
 		while (OPN->eg_timer >= OPN->eg_timer_overflow) {
 			OPN->eg_timer -= OPN->eg_timer_overflow;
 			OPN->eg_cnt++;
-			advance_eg_channel(OPN, &cch[0]->SLOT[SLOT1]);
-			advance_eg_channel(OPN, &cch[1]->SLOT[SLOT1]);
-			advance_eg_channel(OPN, &cch[2]->SLOT[SLOT1]);
-			advance_eg_channel(OPN, &cch[3]->SLOT[SLOT1]);
+			if (!eg_set) {
+				eg_off_set(cch[0]);
+				eg_off_set(cch[1]);
+				eg_off_set(cch[2]);
+				eg_off_set(cch[3]);
+				eg_set = 1;
+			}
+			if (eg_live0)
+				advance_eg_channel(OPN, &cch[0]->SLOT[SLOT1]);
+			if (eg_live1)
+				advance_eg_channel(OPN, &cch[1]->SLOT[SLOT1]);
+			if (eg_live2)
+				advance_eg_channel(OPN, &cch[2]->SLOT[SLOT1]);
+			if (eg_live3)
+				advance_eg_channel(OPN, &cch[3]->SLOT[SLOT1]);
 		}
 
 #if NEO_YM_EARLYOUT
-		/* calculate FM — skip fully quiet channels (EG still advanced above) */
-		if (fm_chan_alive(cch[0]))
+		YMP_MARK(0);
+		/* calculate FM — skip the channels silent for this call (above) */
+		if (fm_live0)
 			chan_calc(OPN, cch[0]);
-		if (fm_chan_alive(cch[1]))
+		if (fm_live1)
 			chan_calc(OPN, cch[1]);
-		if (fm_chan_alive(cch[2]))
+		if (fm_live2)
 			chan_calc(OPN, cch[2]);
-		if (fm_chan_alive(cch[3]))
+		if (fm_live3)
 			chan_calc(OPN, cch[3]);
+		YMP_MARK(1);
 #else
 		chan_calc(OPN, cch[0]);
 		chan_calc(OPN, cch[1]);
@@ -3088,16 +3292,12 @@ void YM2610Update_stream(int length) {
 #else
 		outn = SSG_CALC(outn);
 #endif
+		YMP_MARK(2);
 
 #if NEO_YM_EARLYOUT
 		if (adpcm_b_live)
 			OPNB_ADPCMB_CALC(&YM2610.adpcmb);
-		if (adpcm_a_live) {
-			for (j = 0; j < 6; j++) {
-				if (YM2610.adpcma[j].flag)
-					OPNB_ADPCMA_calc_chan(&YM2610.adpcma[j]);
-			}
-		}
+		YMP_MARK(3);
 #else
 		/* deltaT ADPCM */
 		if (YM2610.adpcmb.portstate & 0x80)
@@ -3113,8 +3313,8 @@ void YM2610Update_stream(int length) {
 		rt = 0;
 #if NEO_YM_EARLYOUT
 		if (adpcm_a_live) {
-			lt = out_adpcma[OUTD_LEFT] + out_adpcma[OUTD_CENTER];
-			rt = out_adpcma[OUTD_RIGHT] + out_adpcma[OUTD_CENTER];
+			lt = adpcma_l[i];
+			rt = adpcma_r[i];
 		}
 		if (adpcm_b_live) {
 			lt += (out_delta[OUTD_LEFT] + out_delta[OUTD_CENTER]) >> 9;
@@ -3156,7 +3356,9 @@ void YM2610Update_stream(int length) {
 		//my_timer();
 
 		INTERNAL_TIMER_A( OPN->ST , cch[1] );
+		YMP_MARK(5);
 	} INTERNAL_TIMER_B(OPN->ST,length);
+	YMP_END();
 
 #endif /* !NEO_DISABLE_YM2610 */
 }

@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- Garbled sprites from zips of the carts whose 2 MiB sprite chips are
+  mapped in two halves (Viewpoint, Fatal Fury 2, Art of Fighting, 3 Count
+  Bout, King of the Monsters 2, Sengoku 2, Super Sidekicks, World Heroes):
+  the zip loader laid every chip back to back; it now places the halves
+  as MAME does (second half 0x400000 above the first, gaps empty). A copy
+  cached by an older core is cached again on first launch (its size
+  differs).
 - Metal Slug X no longer stops at the copyright warning: its cart's
   protection chip is emulated as in current MAME (prot_mslugx.cpp, on
   $2FFFE0-$2FFFEF). The old GnGeo ROM patch never ran in this port, and
@@ -39,6 +46,74 @@
   mslug2 replay paired by window: 68000 -14 to -17% in every gameplay
   window (e.g. 2.60M -> 2.21M cycles a frame), the frame 91% -> 84% of
   budget at its heaviest; state hashes identical.
+- YM2610: the silent-FM-channel test (all four slots in EG_OFF) once per
+  update call instead of every sample (gw-arcade-core f5511ed); output
+  identical (audio hashes, 10 games; a control that mutes one channel
+  changes them all).
+- YM2610 envelopes: the operator slots that are off (without SSG-EG) are
+  set once per call and skipped by every envelope tick, and a channel
+  whose four slots are off skips its ticks altogether. ADPCM-A is
+  rendered channel by channel over the whole call (its state in
+  registers) into two speaker sums the sample loop adds. Output
+  identical (10 games; controls on each path change the audio).
+- Sprite tiles (full width): each row's two words are loaded once, with
+  word loads when the tile data is 4-byte aligned (it was 8 byte loads a
+  row, for .gno payloads that may not be); a row with no transparent pixel
+  skips the per-pixel test and stores two pixels at a time where aligned.
+  Each path walks its own copy of the words with shifts behind an empty
+  asm: GCC had computed all 16 pixels of both paths before the opaque
+  test and spilled 13 of them every row (the first version of the fast
+  path drew 17% SLOWER on the device for that reason; mslug2_11). Picture
+  identical (10 games; controls on the pair, unaligned, per-pixel and
+  flip paths change it). Device, mslug2 replay paired by window
+  (mslug2_12): sprites -24% against the first version, drawing -8%
+  against the build before any fast path (1,032K -> 941K a frame in
+  gameplay, median), heaviest window 81% -> 80%; hashes identical.
+- Narrow (x-zoomed) sprite tiles: the original per-position code (a
+  skipped position two instructions, a kept one eight), on a row loaded
+  once (word loads when aligned; it was 8 byte loads and 6 ORs a row),
+  and empty rows skipped. Two faster-looking versions lost on the device
+  and are not used: a list of the kept pixels (+20-25% on neodrift's
+  narrow tiles, neodrift_7: a serial load -> shift -> load chain per
+  pixel, a taken branch each) and a mask in a register (GCC predicated it:
+  eight instructions for a skipped position too). Picture identical
+  (neodrift 8,077 frames, 10 games; flip controls change it). Device,
+  neodrift paired by window (neodrift_8 vs _6): sprites -5.0% median in
+  the 33 windows with over 200 narrow tiles (every one -2.3..-6.9%), no
+  change without them; hashes identical.
+- The y-zoom table of a vertically shrunk tile is built by its own small
+  function with the state in registers (9 instructions a step, each entry
+  stored once); in draw_screen the counters sat on the stack with a byte
+  load-add-store per step (~15 a step, ~240 a tile). Same arithmetic;
+  picture identical (neodrift, 10 games; a control changes it). Device,
+  neodrift_9 vs _8: sprites -4.3% median over the race windows (-6.0% in
+  the narrow-heavy ones, per-window spread wide), heaviest window 74% ->
+  72%; hashes identical.
+- Sprite tiles crossing the screen edge are clipped in place (rows
+  outside skipped, a column test per drawn pixel). They were drawn whole
+  into a 16x16 scratch filled with a marker colour and copied out pixel
+  by pixel: ~3,950-4,400 device cycles a tile against ~1,300 for a normal
+  one (fitted on viewpoint_1 and neodrift_9; Viewpoint draws ~71 a
+  frame). The old copy also dropped opaque pixels whose colour equalled
+  the marker (0xF81F): neodrift shows 2,472 such pixels over its replay,
+  now drawn. Host: NEO_CLIPTEST=1 compares old and new code on every
+  clipped tile and on sampled tiles forced over all four edges of a test
+  surface (the picture hash cannot see clipped tiles, and the host never
+  clips left or right: its buffer has a margin). Identical apart from the
+  marker pixels (neodrift, Viewpoint, mslug2; 12M forced draws); six
+  controls fail it. Device, Viewpoint attract paired by window (tile
+  counts identical in all 29): sprites -14.2% in the windows with clipped
+  tiles (every one -10.9..-16.5%), ~1,370 cycles saved per clipped tile;
+  68000 unchanged.
+- PROF/vsplit: draw_screen's clear, sprites and fix layer per drawn frame.
+- PROF/tiles (host NEO_TILESTAT=1): tiles per frame by path (full width,
+  y-zoomed, narrow, clipped).
+- ITCM: GnGeo's transparency-pack tile variants (50%/25% blended, an
+  emulator add-on this port never loads) are compiled out (NEO_TRANSPACK=1
+  restores them), and the YM2610/Z80 init and reset functions moved to RAM
+  (.ram_cold): ITCM 65,312 -> 53,784 bytes, 11.7K free.
+- PROF/ym: the YM2610 loop split (eg, fm, ssg, adpcmb, adpcma, mix), every
+  other call instrumented so the log also shows the clean cost.
 - PROF/cpi: device cycles per emulated 68000 and Z80 instruction
   (mslug2 gameplay: 68000 ~131 at -Os, Z80 ~104).
 - The 68000 interpreter (m68kcpu.o) is built at -O2, the rest of the core

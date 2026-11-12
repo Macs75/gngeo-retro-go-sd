@@ -105,6 +105,7 @@ Uint32 ddaxskip_i[16] = {
 };
 Uint32 dda_x_skip_i;
 
+
 static __inline__ Uint16 alpha_blend(Uint16 dest, Uint16 src, Uint8 a) {
 	static Uint8 dr, dg, db, sr, sg, sb;
 
@@ -126,7 +127,7 @@ static __inline__ Uint16 alpha_blend(Uint16 dest, Uint16 src, Uint8 a) {
 #define BLEND16_25(a,b) alpha_blend(a,b,63)
 
 
-char dda_y_skip[17];
+char dda_y_skip[17] __attribute__((aligned(4)));   /* neo_yzoom_table clears it by words */
 Uint32 dda_y_skip_i;
 Uint32 full_y_skip_i = 0xFFFE;
 char full_y_skip[16] = {0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
@@ -253,8 +254,18 @@ static void fix_value_init(void) {
 /* Drawing function generation */
 #define RENAME(name) name##_tile
 #define PUTPIXEL(dst,src) dst=src
+#define NEO_TILE_PAIRS   /* this variant does not read the destination */
 #include "video_template.h"
+#undef NEO_TILE_PAIRS
 
+/* GnGeo's transparency packs (a file marking tiles 50%/25% transparent):
+ * an emulator add-on, not Neo Geo hardware, and this port loads none --
+ * its loaders only ever mark tiles normal or invisible. NEO_TRANSPACK=1
+ * builds the blended variants back (they took 9K of the 64K ITCM). */
+#ifndef NEO_TRANSPACK
+#define NEO_TRANSPACK 0
+#endif
+#if NEO_TRANSPACK
 #define RENAME(name) name##_tile_50
 #define PUTPIXEL(dst,src) dst=BLEND16_50(src,dst)
 #include "video_template.h"
@@ -262,7 +273,9 @@ static void fix_value_init(void) {
 #define RENAME(name) name##_tile_25
 #define PUTPIXEL(dst,src) dst=BLEND16_25(src,dst)
 #include "video_template.h"
+#endif
 
+#if NEO_TRANSPACK
 /*
  * Edge tiles: render into a scratch then blit with clipping.
  * Do NOT skip RGB 0 — opaque black/dark pens are valid (clouds etc.);
@@ -320,6 +333,222 @@ static void draw_tile_clipped(unsigned int tileno, int sx, int sy, int zx, int z
 	}
 }
 
+#else
+/*
+ * A tile crossing the screen edge, clipped in place: rows outside are
+ * skipped (their source rows still stepped), and each drawn pixel tests
+ * its column. Same pixels as draw_tile draws inside the screen: the rows
+ * through full_y_skip / dda_y_skip, the columns through dda_x_skip when
+ * narrow. It was drawn whole into a 16x16 scratch pre-filled with a marker
+ * colour and copied out pixel by pixel (~3 times a normal tile's cost on
+ * the device; that copy also dropped any opaque pixel whose colour
+ * happened to equal the marker, 0xF81F).
+ */
+static __attribute__((noinline)) void draw_tile_clipped(unsigned int tileno, int sx, int sy, int zx, int zy,
+			      int color, int xflip, int yflip)
+{
+	const int bw = buffer->w, bh = buffer->h, pitch = buffer->pitch >> 1;
+	Uint16 *pix = (Uint16 *)buffer->pixels;
+	const Uint16 *pal = &current_pc_pal[16 * color];
+	const neo_u32_ua *g;
+	const char *ysk, *xsk = dda_x_skip;
+	int l, i;
+
+	if (zx < 1) zx = 1;
+	if (zy < 1) zy = 1;
+	if (zx > 16) zx = 16;
+	if (zy > 16) zy = 16;
+	if (!memory.rom.tiles.p || memory.nb_of_tiles == 0)
+		return;
+	tileno = tileno % memory.nb_of_tiles;
+	g = (const neo_u32_ua *)&memory.rom.tiles.p[tileno << 7];
+	ysk = (zy == 16) ? full_y_skip : dda_y_skip;
+
+	/* full width: the visible columns [i0, i1) of the 16 */
+	{
+	const int i0 = sx < 0 ? -sx : 0;
+	const int i1 = (sx + 16 > bw) ? bw - sx : 16;
+
+	for (l = 0; l < zy; l++) {
+		const int yy = yflip ? sy + zy - 1 - l : sy + l;
+		unsigned int a, b;
+		Uint16 *br;
+
+		g += ysk[l] << 1;
+		if ((unsigned)yy >= (unsigned)bh)
+			continue;
+		a = g[0];
+		b = g[1];
+		if (!(a | b))
+			continue;
+		if (xflip) {
+			/* pixel order reversed: reverse the 16 nibbles, so that the
+			 * next pixel is always the top nibble of a, then of b */
+			unsigned int t = __builtin_bswap32(b);
+			b = __builtin_bswap32(a);
+			a = ((t >> 4) & 0x0f0f0f0fu) | ((t & 0x0f0f0f0fu) << 4);
+			b = ((b >> 4) & 0x0f0f0f0fu) | ((b & 0x0f0f0f0fu) << 4);
+		}
+		br = pix + yy * pitch + sx;
+		if (zx == 16) {
+			for (i = 0; i < i0; i++) {
+				a = (a << 4) | (b >> 28);
+				b <<= 4;
+			}
+			for (; i < i1; i++) {
+				const unsigned int col = a >> 28;
+				a = (a << 4) | (b >> 28);
+				b <<= 4;
+				if (col)
+					br[i] = pal[col];
+			}
+		} else {
+			int x = sx;
+			for (i = 0; i < 16; i++) {
+				const unsigned int col = a >> 28;
+				a = (a << 4) | (b >> 28);
+				b <<= 4;
+				if (xsk[i]) {
+					if (col && (unsigned)x < (unsigned)bw)
+						*br = pal[col];
+					br++;
+					x++;
+				}
+			}
+		}
+	}
+	}
+}
+#endif
+
+#if defined(HOST_BUILD) && !NEO_TRANSPACK
+/* NEO_CLIPTEST=1 (host): every edge-clipped tile is also drawn by the
+ * original scratch-and-copy code into a copy of the frame buffer, and the
+ * two buffers compared -- the host's picture hash cannot see these tiles
+ * (they fall in the buffer's off-screen margin). Counts at exit. */
+/*
+ * Edge tiles: render into a scratch then blit with clipping.
+ * Do NOT skip RGB 0 — opaque black/dark pens are valid (clouds etc.);
+ * only pen 0 is skipped by draw_tile itself (left as sentinel).
+ */
+static void draw_tile_clipped_old(unsigned int tileno, int sx, int sy, int zx, int zy,
+			      int color, int xflip, int yflip,
+			      void (*draw_fn)(unsigned int, int, int, int, int,
+					      int, int, int, unsigned char *))
+{
+	Uint16 tmp[16 * 16];
+	void *save_pix = buffer->pixels;
+	Uint16 save_pitch = buffer->pitch;
+	int save_w = buffer->w;
+	int save_h = buffer->h;
+	int pitch = save_pitch >> 1;
+	int x, y;
+	/* Sentinel: draw_tile only writes opaque pens; untouched = SENT. */
+	const Uint16 SENT = 0xF81Fu;
+
+	if (zx < 1) zx = 1;
+	if (zy < 1) zy = 1;
+	if (zx > 16) zx = 16;
+	if (zy > 16) zy = 16;
+
+	/* Fill sentinel with word stores (faster than a byte memset). */
+	{
+		Uint32 *p = (Uint32 *)tmp;
+		Uint32 sent2 = ((Uint32)SENT << 16) | SENT;
+		for (y = 0; y < (16 * 16) / 2; y++)
+			p[y] = sent2;
+	}
+	buffer->pixels = tmp;
+	buffer->pitch = (Uint16)(16 * 2);
+	buffer->w = 16;
+	buffer->h = 16;
+	draw_fn(tileno, 0, 0, zx, zy, color, xflip, yflip, (unsigned char *)tmp);
+	buffer->pixels = save_pix;
+	buffer->pitch = save_pitch;
+	buffer->w = save_w;
+	buffer->h = save_h;
+
+	for (y = 0; y < zy; y++) {
+		int yy = sy + y;
+		if ((unsigned)yy >= (unsigned)save_h)
+			continue;
+		for (x = 0; x < zx; x++) {
+			int xx = sx + x;
+			Uint16 p = tmp[y * 16 + x];
+			if (p == SENT)
+				continue;
+			if ((unsigned)xx < (unsigned)save_w)
+				((Uint16 *)save_pix)[yy * pitch + xx] = p;
+		}
+	}
+}
+
+
+static unsigned long cliptest_n, cliptest_bad, cliptest_tot, cliptest_mark;
+static unsigned long cliptest_syn, cliptest_syn_bad;
+static void draw_tile_clipped(unsigned int tileno, int sx, int sy, int zx, int zy,
+			      int color, int xflip, int yflip);
+
+/* The host never clips at the left or right edge (its buffer has a margin
+ * there), the device mostly does: draw the tile at forced positions over
+ * every edge and corner of a small surface, old code against new. A pixel
+ * that differs only because the new picture has the old marker colour
+ * there is the old code's quirk, not counted. */
+static void cliptest_synth(unsigned int tileno, int zx, int zy, int color, int xflip, int yflip,
+			   void (*fn)(unsigned int, int, int, int, int, int, int, int, unsigned char *))
+{
+	enum { W = 48, H = 40 };
+	static Uint16 A[W * H], B[W * H];
+	static const int pos[][2] = {
+		{-5, 12}, {-13, 12}, {W - 7, 12}, {W - 14, 12}, {W - 1, 12}, {-15, 12},
+		{12, -6}, {12, H - 5}, {-4, -9}, {W - 3, H - 2}, {-11, H - 9}, {W - 9, -3},
+	};
+	void *sp = buffer->pixels;
+	Uint16 spitch = buffer->pitch;
+	int sw = buffer->w, sh = buffer->h;
+	unsigned k, q;
+
+	for (k = 0; k < sizeof(pos) / sizeof(pos[0]); k++) {
+		int bad = 0;
+		for (q = 0; q < W * H; q++)
+			A[q] = B[q] = (Uint16)(0x1234 + q);
+		buffer->pitch = W * 2; buffer->w = W; buffer->h = H;
+		buffer->pixels = A;
+		draw_tile_clipped_old(tileno, pos[k][0], pos[k][1], zx, zy, color, xflip, yflip, fn);
+		buffer->pixels = B;
+		draw_tile_clipped(tileno, pos[k][0], pos[k][1], zx, zy, color, xflip, yflip);
+		buffer->pixels = sp; buffer->pitch = spitch; buffer->w = sw; buffer->h = sh;
+		for (q = 0; q < W * H; q++)
+			if (A[q] != B[q] && B[q] != 0xF81F)
+				bad = 1;
+		cliptest_syn++;
+		if (bad) {
+			if (cliptest_syn_bad < 4)
+				printf("CLIPSYN: tile %u zx=%d zy=%d xf=%d yf=%d at (%d,%d) differs\n",
+				       tileno, zx, zy, xflip, yflip, pos[k][0], pos[k][1]);
+			cliptest_syn_bad++;
+		}
+	}
+}
+static void cliptest_report(void)
+{
+	printf("CLIPTEST/edges: %lu forced edge draws, %lu differ\n", cliptest_syn, cliptest_syn_bad);
+	printf("CLIPTEST: %lu clipped tiles, %lu with a different result (%lu pixels, %lu of them the old code's marker colour 0xF81F)\n", cliptest_n, cliptest_bad, cliptest_tot, cliptest_mark);
+}
+#endif
+
+/* Tiles drawn per frame by path (PROF/tiles, host NEO_TILESTAT=1):
+ * [0] full width (zx 16) inside the screen, [1] of those y-zoomed (zy < 16),
+ * [2] narrow (zx < 16, the x-zoom path) inside, [3] edge-clipped (drawn into
+ * a scratch, copied out). Fully transparent tiles never get here. */
+#if defined(NEO_PROF) || defined(HOST_BUILD)
+#define NEO_TILESTAT 1
+unsigned int neo_tile_cnt[4];
+#define TILE_COUNT(k) (neo_tile_cnt[k]++)
+#else
+#define TILE_COUNT(k) ((void)0)
+#endif
+
 static void draw_sprite_tile(unsigned int tileno, int sx, int sy, int zx, int zy,
 			     int color, int xflip, int yflip, Uint8 penusage)
 {
@@ -333,12 +562,14 @@ static void draw_sprite_tile(unsigned int tileno, int sx, int sy, int zx, int zy
 		return;
 
 	switch (penusage) {
+#if NEO_TRANSPACK
 	case TILE_TRANSPARENT50:
 		fn = draw_tile_50;
 		break;
 	case TILE_TRANSPARENT25:
 		fn = draw_tile_25;
 		break;
+#endif
 	case TILE_INVISIBLE:
 		return;
 	default:
@@ -346,11 +577,66 @@ static void draw_sprite_tile(unsigned int tileno, int sx, int sy, int zx, int zy
 		break;
 	}
 
+#if defined(HOST_BUILD) && !NEO_TRANSPACK
+	{
+		static int on = -1;
+		static unsigned n;
+		if (on < 0) on = getenv("NEO_CLIPTEST") != NULL;
+		if (on && (n++ & 7) == 0)
+			cliptest_synth(tileno, zx, zy, color, xflip, yflip, fn);
+	}
+#endif
 	if (dx >= 0 && dx + zx <= bw && sy >= 0 && sy + zy <= bh) {
+		if (zx == 16) {
+			TILE_COUNT(0);
+			if (zy < 16)
+				TILE_COUNT(1);
+		} else
+			TILE_COUNT(2);
 		fn(tileno, dx, sy, zx, zy, color, xflip, yflip,
 		   (unsigned char *)buffer->pixels);
 	} else {
+		TILE_COUNT(3);
+#if NEO_TRANSPACK
 		draw_tile_clipped(tileno, dx, sy, zx, zy, color, xflip, yflip, fn);
+#else
+#ifdef HOST_BUILD
+		{
+			static int on = -1;
+			if (on < 0) {
+				on = getenv("NEO_CLIPTEST") != NULL;
+				if (on) atexit(cliptest_report);
+			}
+			if (on) {
+				size_t n = (size_t)buffer->pitch * (size_t)buffer->h;
+				void *real = buffer->pixels, *copy = malloc(n);
+				memcpy(copy, real, n);
+				buffer->pixels = copy;
+				draw_tile_clipped_old(tileno, dx, sy, zx, zy, color, xflip, yflip, fn);
+				buffer->pixels = real;
+				draw_tile_clipped(tileno, dx, sy, zx, zy, color, xflip, yflip);
+				cliptest_n++;
+				if (memcmp(copy, real, n)) {
+					size_t q, nd = 0, nmark = 0;
+					for (q = 0; q < n / 2; q++)
+						if (((Uint16 *)copy)[q] != ((Uint16 *)real)[q]) {
+							nd++;
+							if (((Uint16 *)real)[q] == 0xF81F) nmark++;
+						}
+					if (cliptest_bad < 6)
+						printf("CLIPDIFF: tile %u zx=%d zy=%d xf=%d yf=%d dx=%d sy=%d: %zu pixels differ, %zu of them the marker colour in the new picture\n",
+						       tileno, zx, zy, xflip, yflip, dx, sy, nd, nmark);
+					cliptest_tot += nd; cliptest_mark += nmark;
+					cliptest_bad++;
+				}
+				free(copy);
+				return;
+			}
+		}
+#endif
+		(void)fn;
+		draw_tile_clipped(tileno, dx, sy, zx, zy, color, xflip, yflip);
+#endif
 	}
 }
 
@@ -603,7 +889,50 @@ static __inline__ void draw_fix_char(unsigned char *buf, int start, int end) {
 	if (start != 0 && end != 0) SDL_SetClipRect(buffer, NULL);
 }
 
+/* The y-zoom table of one tile (GnGeo's DDA, unchanged arithmetic): 16
+ * source rows stepped by s = zoom + 1; a row is output each time the
+ * accumulator wraps. dda_y_skip[k] = source rows to advance before output
+ * row k. Returns the number of output rows | the accumulator << 8 (it
+ * carries to the strip's next tile; 1..256 after a tile). Each entry is
+ * stored once: the original kept its counters in memory and did a byte
+ * load-add-store on the table per step (~240 instructions a tile on the
+ * device). GCC: noinline -- inlined into draw_screen, which has no free
+ * register, the accumulator went back to the stack. */
+static __attribute__((noinline)) unsigned int neo_yzoom_table(int s, int d)
+{
+	typedef Uint32 u32_alias __attribute__((may_alias));
+	u32_alias *z = (u32_alias *)dda_y_skip;
+	char *t = dda_y_skip;
+	int ys = 0, c = 0, i;
+	z[0] = z[1] = z[2] = z[3] = 0;
+	t[16] = 0;
+	for (i = 0; i < 16; i++) {
+		d -= s;
+		if (d <= 0) {
+			d += 256;
+			t[ys] = (char)c;
+			ys++;
+			c = 0;
+		}
+		c++;
+	}
+	t[ys] = (char)c;
+	return (unsigned int)ys | ((unsigned int)d << 8);
+}
+
+#if defined(NEO_PROF) && !defined(HOST_BUILD)
+/* PROF/vsplit (neo_prof.c): draw_screen's clear, sprites and fix layer */
+unsigned int neo_vid_part[3], neo_vid_frames;
+#define VIDP_NOW() (*(volatile unsigned int *)0xE0001004u)
+#define VIDP_DECL unsigned int vidp_t = VIDP_NOW(), vidp_n
+#define VIDP_MARK(k) do { vidp_n = VIDP_NOW(); neo_vid_part[k] += vidp_n - vidp_t; vidp_t = vidp_n; } while (0)
+#else
+#define VIDP_DECL int vidp_unused_ __attribute__((unused))
+#define VIDP_MARK(k) do { } while (0)
+#endif
+
 void draw_screen(void) {
+	VIDP_DECL;
 	int sx = 0, sy = 0, oy = 0, my = 0, zx = 1, rzy = 1;
 	unsigned int offs, i, count, y;
 	unsigned int tileno, tileatr, t1, t2, t3;
@@ -616,6 +945,7 @@ void draw_screen(void) {
 
 	SDL_FillRect(buffer, NULL, current_pc_pal[4095]);
 	SDL_LockSurface(buffer);
+	VIDP_MARK(0);
 
 	/* Draw sprites */
 	for (count = 0; count < 0x300; count += 2) {
@@ -741,23 +1071,10 @@ void draw_screen(void) {
 
 
 			if (rzy != 255) {
-				yskip = 0;
 				dda_y_skip_i = 0;
-				dda_y_skip[0] = 0;
-				for (i = 0; i < 16; i++) {
-					dda_y_skip[i + 1] = 0;
-					dday -= (rzy + 1);
-					if (dday <= 0) {
-						dday += 256;
-						yskip++;
-						dda_y_skip[yskip]++;
-					} else dda_y_skip[yskip]++;
-
-					//if (dda_y_skip[i])
-					//	    dda_y_skip_i=dda_y_skip_i|(1<<i);
-				}
-				//printf("%04x\n",dda_y_skip_i);
-
+				unsigned int yz = neo_yzoom_table(rzy + 1, dday);
+				yskip = (int)(yz & 0xff);
+				dday = (int)(yz >> 8);
 			}
 
 
@@ -781,9 +1098,27 @@ void draw_screen(void) {
 			sy += yskip;
 		} /* for y */
 	} /* for count */
+	VIDP_MARK(1);
 
 	draw_fix_char(buffer->pixels, 0, 0);
 	SDL_UnlockSurface(buffer);
+	VIDP_MARK(2);
+#if defined(NEO_PROF) && !defined(HOST_BUILD)
+	neo_vid_frames++;
+#endif
+#ifdef HOST_BUILD
+	{	/* NEO_TILESTAT=1 (host): the tile counts per drawn frame, every 120 */
+		static int on = -1, n;
+		if (on < 0) on = getenv("NEO_TILESTAT") != NULL;
+		if (on && ++n == 120) {
+			printf("TILES: full=%u yzoom=%u narrow=%u clipped=%u per drawn frame\n",
+			       neo_tile_cnt[0] / n, neo_tile_cnt[1] / n, neo_tile_cnt[2] / n,
+			       neo_tile_cnt[3] / n);
+			memset(neo_tile_cnt, 0, sizeof(neo_tile_cnt));
+			n = 0;
+		}
+	}
+#endif
 
 	if (conf.do_message) {
 		SDL_textout(buffer, visible_area.x, visible_area.h + visible_area.y - 13, conf.message);
@@ -955,6 +1290,7 @@ void draw_screen_scanline(int start_line, int end_line, int refresh) {
 					draw_scanline_tile(tileno, yoffs, sx + NEO_SCR_XOFF, yy, zx, tileatr >> 8,
 							tileatr & 0x01, (unsigned char*) buffer->pixels);
 					break;
+#if NEO_TRANSPACK
 				case TILE_TRANSPARENT50:
 					draw_scanline_tile_50(tileno, yoffs, sx + NEO_SCR_XOFF, yy, zx, tileatr >> 8,
 							tileatr & 0x01, (unsigned char*) buffer->pixels);
@@ -963,6 +1299,7 @@ void draw_screen_scanline(int start_line, int end_line, int refresh) {
 					draw_scanline_tile_25(tileno, yoffs, sx + NEO_SCR_XOFF, yy, zx, tileatr >> 8,
 							tileatr & 0x01, (unsigned char*) buffer->pixels);
 					break;
+#endif
 #endif
 			}
 

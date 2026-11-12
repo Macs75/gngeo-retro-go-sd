@@ -300,19 +300,53 @@ static int append_rom_files(ROM_DEF *drv, const neo_chip_t *arr, int n,
     return 1;
 }
 
+/*
+ * Carts whose 2 MiB sprite chips are mapped in two halves (MAME ROM_LOAD16_BYTE
+ * + ROM_CONTINUE): pair k (C1/C2, C3/C4) sits at k * 0x200000 of the
+ * interleaved region, and a 2 MiB chip's second half 0x400000 above its
+ * first; a smaller chip is whole at its base. The region is 0x600000, or
+ * 0x800000 when C3/C4 are split too; what no chip covers is empty. Laid
+ * back to back (as every other cart), the second halves land 2 MiB low
+ * and their tiles are garbage (Viewpoint's backgrounds). The carts, by
+ * NGH number: kotm2 039, sengoku2 040, 3countb 043, aof 044, fatfury2 047,
+ * viewpoin 051, ssideki 052, wh1 053 (MAME neogeo.cpp).
+ */
+static int s_crom_split;
+
+static int crom_split_cart(const char *c1_name)
+{
+    static const char ngh[][4] = { "039", "040", "043", "044", "047", "051", "052", "053" };
+    unsigned i;
+    if (!c1_name || c1_name[3] != '-')
+        return 0;
+    for (i = 0; i < sizeof(ngh) / sizeof(ngh[0]); i++)
+        if (!memcmp(c1_name, ngh[i], 3))
+            return 1;
+    return 0;
+}
+
 static int append_crom_pairs(ROM_DEF *drv, const neo_chip_t *c, int nc,
                              uint32_t *tiles_out)
 {
-    uint32_t off = 0;
+    uint32_t off = 0, split_end = 0;
     int i;
     if (nc < 2 || (nc & 1))
         return 0;
+    s_crom_split = nc <= 4 && crom_split_cart(c[0].name);
     for (i = 0; i < nc; i += 2) {
         uint32_t sz = c[i].size;
         if (c[i + 1].size != sz)
             return 0;
         if (drv->nb_romfile + 2 > 32)
             return 0;
+        if (s_crom_split) {
+            /* pair k at k * 0x200000; ensure_tiles places the halves */
+            uint32_t end;
+            off = (uint32_t)(i / 2) * 0x200000u;
+            end = (sz == 0x200000u) ? off + 0x600000u : off + sz * 2u;
+            if (end > split_end)
+                split_end = end;
+        }
         /* even plane */
         memset(&drv->rom[drv->nb_romfile], 0, sizeof(drv->rom[0]));
         {
@@ -341,6 +375,8 @@ static int append_crom_pairs(ROM_DEF *drv, const neo_chip_t *c, int nc,
         drv->nb_romfile++;
         off += sz * 2u;
     }
+    if (s_crom_split)
+        off = split_end;
     if (tiles_out)
         *tiles_out = off;
     return 1;
@@ -1131,9 +1167,11 @@ static int ensure_sfix(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
 
 static int stream_crom_pair(neo_zip_t *z, const char *even_name, uint32_t even_crc,
                             const char *odd_name, uint32_t odd_crc,
-                            uint32_t file_size, uint32_t *spr_usage,
+                            uint32_t skip, uint32_t file_size, uint32_t *spr_usage,
                             uint32_t tile_base_index, flash_stream_t *st)
 {
+    /* streams file_size bytes of each chip from offset skip (a split
+     * chip's second half: the first is inflated again and dropped) */
     neo_zip_file_t *fe, *fo;
     uint8_t even[64], odd[64], tile[128];
     uint32_t left = file_size;
@@ -1156,6 +1194,18 @@ static int stream_crom_pair(neo_zip_t *z, const char *even_name, uint32_t even_c
         return 0;
     }
     odd_title_at = file_size / 2u;
+
+    while (skip) {
+        uint32_t chunk = skip > 64 ? 64 : skip;
+        if (neo_zip_fread(fe, even, (int)chunk) != (int)chunk ||
+            neo_zip_fread(fo, odd, (int)chunk) != (int)chunk) {
+            neo_zip_fclose(fe);
+            neo_zip_fclose(fo);
+            zip_set_err("CROM short read");
+            return 0;
+        }
+        skip -= chunk;
+    }
 
     while (left) {
         uint32_t chunk = left > 64 ? 64 : left;
@@ -1318,13 +1368,60 @@ static int ensure_tiles(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
         zip_set_err("ROM too large for flash");
         return 0;
     }
-    for (i = 0; i < np; i++) {
-        uint32_t tile_base = pairs[i].dest / 128u;
-        if (!stream_crom_pair(z, pairs[i].even, pairs[i].ecrc,
-                              pairs[i].odd, pairs[i].ocrc,
-                              pairs[i].size, spr_usage, tile_base, &st)) {
-            stream_abort(&st);
-            return 0;
+    {
+        /* The region in address order: each pair whole, or (s_crom_split)
+         * a 2 MiB chip's halves 0x400000 apart; gaps are empty tiles. */
+        struct { int pair; uint32_t skip, len, dest; } seg[16];
+        int ns = 0, a, b;
+        uint32_t pos = 0;
+
+        for (i = 0; i < np; i++) {
+            if (s_crom_split && pairs[i].size == 0x200000u) {
+                seg[ns].pair = i; seg[ns].skip = 0; seg[ns].len = 0x100000u;
+                seg[ns++].dest = pairs[i].dest;
+                seg[ns].pair = i; seg[ns].skip = 0x100000u; seg[ns].len = 0x100000u;
+                seg[ns++].dest = pairs[i].dest + 0x400000u;
+            } else {
+                seg[ns].pair = i; seg[ns].skip = 0; seg[ns].len = pairs[i].size;
+                seg[ns++].dest = pairs[i].dest;
+            }
+        }
+        for (a = 0; a < ns; a++)
+            for (b = a + 1; b < ns; b++)
+                if (seg[b].dest < seg[a].dest) {
+                    typeof(seg[0]) tmp = seg[a];
+                    seg[a] = seg[b];
+                    seg[b] = tmp;
+                }
+        for (a = 0; a <= ns; a++) {
+            uint32_t until = a < ns ? seg[a].dest : tiles;
+            if (until < pos) {
+                stream_abort(&st);
+                zip_set_err("CROM layout overlap");
+                return 0;
+            }
+            while (pos < until) {            /* empty tiles up to the next chip */
+                uint8_t zero[128];
+                uint32_t tileno = pos / 128u;
+                memset(zero, 0, sizeof(zero));
+                spr_usage[tileno >> 4] |= convert_one_tile(zero, (int)tileno);
+                if (!append_bytes(&st, zero, 128) || !prog_bump(128)) {
+                    stream_abort(&st);
+                    zip_set_err("tile append failed");
+                    return 0;
+                }
+                pos += 128u;
+            }
+            if (a == ns)
+                break;
+            if (!stream_crom_pair(z, pairs[seg[a].pair].even, pairs[seg[a].pair].ecrc,
+                                  pairs[seg[a].pair].odd, pairs[seg[a].pair].ocrc,
+                                  seg[a].skip, seg[a].len, spr_usage,
+                                  seg[a].dest / 128u, &st)) {
+                stream_abort(&st);
+                return 0;
+            }
+            pos = seg[a].dest + seg[a].len * 2u;
         }
     }
     hit_c = stream_finish(&st);
