@@ -20,6 +20,12 @@
 - A missing .gno file is reported as "ROM file not found", a failed
   flash cache as "ROM caching failed" (both said "ROM too large for
   flash").
+- An encrypted MAME zip (sprite chips but no fix-layer chip: the CMC42/
+  CMC50 sets, e.g. sengoku3, kof99, garou, mslug3) is reported as
+  encrypted, with the PC tool to decrypt it (tools/decrypt_neogeo_zip)
+  and the name to copy (<game>_dec.zip), before anything is written to
+  flash; it said "zip missing p/m/s/v/c". The error screen fits a message
+  of several lines.
 
 ### Changed
 
@@ -124,6 +130,50 @@
   window 86% -> 82% of budget; state hashes identical.
 - Recordings are version 2 and carry the audio rate; version 1
   recordings are refused (they predate the timing change).
+
+### Added
+
+- Host wait-loop census: NEO_IDLESTAT=1 prints, per 68000 wait loop, the
+  cycles the idle skip jumped over and the cycles it ran pass by pass
+  (IDLESTAT, at exit) and the game's own loops per frame (IDLEFRAME).
+  tools/neo_idle_census.sh runs it over a ROM folder (loops and their
+  code), tools/neo_idle_frames.py gives the share left in the busiest
+  frames, tools/neo_dis68k.py disassembles a zip's P ROM.
+
+### Parked: wait loops in closed form (measured, not implemented)
+
+When a wait loop's pass changes the machine, the idle skip runs the
+passes one by one (~125 device cycles per 68000 instruction, like the
+interpreter). Census, 138 games, 2 minutes of attract each: 101 wait in a
+game loop after boot, 88 of them are jumped over at once, 12 run in place
+(33-124K of the 202,752 68000 cycles a frame):
+
+- Counter loops, a closed form is possible (N passes = one pass plus N
+  times a constant on the counter): aof, aof2, fightfev, turfmast (a
+  constant added to a memory word, then a flag test), sengoku2, kotm2 (the
+  counter in a register), doubledr (a second counter ends the loop after
+  N passes), mslug (plus a byte cleared each pass). pspikes2's pass has no
+  counter, only stores of the same value and two calls: the existing
+  check could jump over it if it accepted them.
+- Loops that must be iterated (a random-number step each pass): neodrift
+  and ctomaday (x += rol(x,2) + $3711), flipshot (another formula).
+
+Device gameplay, recorded (AES, 340 MHz):
+
+- fightfev_1: the counter loop runs through every fight, 1.1-1.5M device
+  cycles a frame (20-26% of the frame); the closed form would take busy
+  from ~68% to ~45%. But no frame is dropped (4,319 of 4,320 drawn,
+  worst window 72%, heaviest frame 88%).
+- pspikes2_1: the census loop (000220) runs in the menus only. In the
+  match the main loop (0004ea) calls the game's whole state routine
+  (2aea2: joypads, a jump table, link/movem, nested calls) ~100 times a
+  frame until a counter changes; the skip refuses it (~100 rejects a
+  window) and the 68000 costs 1.97M a frame. No frame dropped (6,839 of
+  6,840, worst window 81%, heaviest frame 96%).
+
+Neither game is short of time, so the closed form would only add
+headroom. Worth doing for a game that drops frames while one of these
+loops is running in place; the census and tools above find it.
 
 ## [v0.0.5]
 

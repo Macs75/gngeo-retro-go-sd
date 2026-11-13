@@ -23,6 +23,10 @@ void neo_idle_slice_end(void);
 void neo_idle_trace(void);
 /* up to that many passes from the head: the passes taken (state committed) */
 unsigned int neo_idle_run(unsigned int laps);
+#ifdef HOST_BUILD
+/* NEO_IDLESTAT=1: one IDLEFRAME line per frame (end of neo_run_frame) */
+void neo_idlestat_frame(void);
+#endif
 #endif
 
 #endif

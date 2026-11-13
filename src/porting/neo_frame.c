@@ -11,6 +11,7 @@
 #include "gngeo_platform.h"
 #include "config.h"
 #include "neo_timing.h"
+#include "neo_idle.h"
 
 #ifndef NEO_DISABLE_VIDEO
 #define NEO_DISABLE_VIDEO 0
@@ -97,6 +98,9 @@ void neo_run_frame(int draw_video)
 
     if (a)
         cpu_68k_interrupt(a);
+#ifdef HOST_BUILD
+    neo_idlestat_frame();
+#endif
 }
 
 int neo_frame_needs_draw(void)

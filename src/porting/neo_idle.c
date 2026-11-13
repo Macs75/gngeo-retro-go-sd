@@ -1296,6 +1296,54 @@ unsigned int neo_idle_t_setup, neo_idle_t_run, neo_idle_t_arm;
 #define IDLE_NOW() 0u
 #endif
 
+#ifdef HOST_BUILD
+/* NEO_IDLESTAT=1 (host): per wait loop, the passes jumped over at once and
+ * the passes run in place, in 68000 cycles, printed at exit -- the census
+ * of which loops the runner pays for (tools/neo_idle_census.sh). */
+static struct { unsigned int head, lap; unsigned long long jumped, ran; } idlestat[32];
+static int idlestat_on = -1;
+static unsigned int idlestat_frame_ran, idlestat_frame_jumped;
+static void idlestat_dump(void)
+{
+    for (int i = 0; i < 32 && idlestat[i].lap; i++)
+        printf("IDLESTAT: head %06x lap %u cycles: jumped %llu cycles, run in place %llu cycles\n",
+               idlestat[i].head, idlestat[i].lap, idlestat[i].jumped, idlestat[i].ran);
+}
+static void idlestat_add(unsigned int cyc, int ran)
+{
+    int i;
+    if (idlestat_on < 0) {
+        idlestat_on = getenv("NEO_IDLESTAT") != NULL;
+        if (idlestat_on) atexit(idlestat_dump);
+    }
+    if (!idlestat_on)
+        return;
+    for (i = 0; i < 31 && idlestat[i].lap && idlestat[i].head != neo_idle_head; i++)
+        ;
+    idlestat[i].head = neo_idle_head;
+    idlestat[i].lap = neo_idle_lap;
+    if (ran) idlestat[i].ran += cyc; else idlestat[i].jumped += cyc;
+    if (neo_idle_head < 0xc00000) {
+        if (ran) idlestat_frame_ran += cyc; else idlestat_frame_jumped += cyc;
+    }
+}
+/* at the end of every frame: the game's own loops (not the BIOS's) in that
+ * frame, "IDLEFRAME <run in place> <jumped>" in 68000 cycles, for the
+ * share left in the busiest frames (tools/neo_idle_frames.py) */
+void neo_idlestat_frame(void)
+{
+    if (idlestat_on < 0) {
+        idlestat_on = getenv("NEO_IDLESTAT") != NULL;
+        if (idlestat_on) atexit(idlestat_dump);
+    }
+    if (idlestat_on)
+        printf("IDLEFRAME %u %u\n", idlestat_frame_ran, idlestat_frame_jumped);
+    idlestat_frame_ran = idlestat_frame_jumped = 0;
+}
+#else
+#define idlestat_add(c, r) ((void)0)
+#endif
+
 /* SKIP: from the head, with `laps` whole passes allowed (header comment,
  * 3); returns the cycles taken. A pass on the shadow first: if it leaves
  * everything as it is, every pass does, and all are consumed at once. */
@@ -1316,6 +1364,7 @@ unsigned int neo_idle_run(unsigned int laps)
 #if defined(NEO_PROF) && !defined(HOST_BUILD)
         neo_idle_t_setup += IDLE_NOW() - t0;
 #endif
+        idlestat_add(laps * neo_idle_lap, 0);
         return laps * neo_idle_lap;
     }
 
@@ -1344,6 +1393,7 @@ unsigned int neo_idle_run(unsigned int laps)
     (void)t0; (void)t1;
 #endif
     neo_idle_ran += used / (neo_idle_lap ? neo_idle_lap : 1);
+    idlestat_add(used, 1);
     return used;
 }
 
