@@ -52,6 +52,27 @@
   pspikes2 (.neo), sengoku3_dec, preisle2_dec (96 + 12 pieces), viewpoin,
   mslug2, kotm2. The host flash cache holds 256 blobs like the firmware's
   (it held 64).
+- A sprite or sample piece of one byte value throughout (unprogrammed
+  EPROM space) is cached once for all games ("neogeo/fill/<value>.<size>")
+  and shared; a region with such pieces gets a small map blob
+  ("<key>.map") saying which, for the launches after. A piece is only
+  written once a byte differs, so a fill piece costs no flash write.
+  mslug4 (decrypted): 70.0 -> 58.1 MiB (25 sprite pieces of 0x00/0xFF,
+  12.5 MiB, and one of its samples), so it fits a 60 MiB cache; preisle2
+  59.35 -> 55.4 MiB. tools/neo_rom_space.py reports a set's padding and
+  duplicates (mslug4: no non-blank aligned block repeats, even at 4 KiB;
+  its other 5 MiB of duplicate tiles are single tiles).
+  The size check before the first copy counts the sprites and the samples
+  as one piece each (whether their pieces are shared is only known once
+  the data is read): it refused mslug4 at 73.5 MB. A set that does not fit
+  after all fails in the copy, with the same error.
+- The fix layer is converted and stored in 8 KiB blocks (it was staged
+  whole in RAM): the CMC sets' 512 KiB fix layer did not fit.
+- Host: NEO_LOAD_TWICE=1 loads the game a second time from the cache just
+  filled (the path of every launch after the first). Old and new builds
+  read identical tiles and samples, and 15 state/picture/audio hashes, on
+  pspikes2 (.neo), sengoku3_dec, preisle2_dec, mslug4_dec, viewpoin,
+  mslug2, kotm2, both loads.
 - The first launch's sprite copy reads the chips in blocks (up to 16 KiB
   of each chip at a time, sized to the RAM left) and writes each block to
   flash at once; it read 64 bytes from one chip then the other per tile.
@@ -186,6 +207,15 @@
 
 ### Added
 
+- tools/decrypt_neogeo_zip writes a compressed zip (deflate; it stored
+  the files): sengoku3_dec 51.0 -> 20.8 MB, preisle2_dec 62.1 -> 26.7 MB.
+  The cached data is the same (host NEO_BLOB_SUM=1: all 97 blobs of
+  sengoku3_dec identical, and 15 state/picture/audio hashes).
+- `make host` and `make decrypt-zip` build with Ubuntu's gcc as they are:
+  fortify is off in both (the repo's src/porting/strings.h #defines bcopy,
+  which glibc's strings_fortified.h cannot compile; it took
+  HOST_CC="gcc -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0"), and the tool gets
+  _GNU_SOURCE for nftw's FTW_DEPTH/FTW_PHYS.
 - Host wait-loop census: NEO_IDLESTAT=1 prints, per 68000 wait loop, the
   cycles the idle skip jumped over and the cycles it ran pass by pass
   (IDLESTAT, at exit) and the game's own loops per frame (IDLEFRAME).

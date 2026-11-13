@@ -37,6 +37,8 @@ void wdog_refresh(void);
 
 /* Typical OSPI smallest erase — payloads are rounded up when programmed. */
 #define NEO_FLASH_ERASE_ALIGN  4096u
+/* the fix layer's conversion block (ensure_sfix): whole 32-byte characters */
+#define SFIX_BLOCK 8192u
 
 /* Shared system blobs that must remain in the cache with any game
  * (UniBIOS + converted sfix + 000-lo). Loaded after the cart in bind, so
@@ -790,22 +792,31 @@ static int key_hit(const char *stem, const char *suf, uint32_t expect,
     return (hit && got == expect) ? 1 : 0;
 }
 
-/* key_hit for a region cached as pieces (pieces_lookup's keys): the
- * pieces in order, stopping at the first one missing */
+/* key_hit for a region cached as pieces (pieces_lookup's keys, its map
+ * and the shared fill pieces): the pieces in order, stopping at the first
+ * one missing */
 static int key_hit_pieces(const char *stem, const char *suf, uint32_t total,
                           const char *kind)
 {
     char key[48], k[64];
-    uint32_t off;
+    uint32_t off, got = 0, n = (total + NEO_PIECE - 1u) / NEO_PIECE;
+    const uint16_t *m;
     int i;
 
     if (total <= NEO_PIECE)
         return key_hit(stem, suf, total, kind);
     make_key(key, sizeof(key), stem, suf, kind);
+    snprintf(k, sizeof(k), "%s.map", key);
+    m = (const uint16_t *)lookup_data_in_flash(k, &got);
+    if (m && got != n * 2u)
+        m = NULL;
     for (i = 0, off = 0; off < total; i++, off += NEO_PIECE) {
         uint32_t want = total - off < NEO_PIECE ? total - off : NEO_PIECE;
-        uint32_t got = 0;
-        snprintf(k, sizeof(k), "%s.%d", key, i);
+        if (m && m[i] != 0xffffu)
+            snprintf(k, sizeof(k), "neogeo/fill/%02x.%u", m[i] & 0xff, (unsigned)want);
+        else
+            snprintf(k, sizeof(k), "%s.%d", key, i);
+        got = 0;
         if (!lookup_data_in_flash(k, &got) || got != want)
             return 0;
     }
@@ -973,19 +984,30 @@ static uint32_t neo_flash_max_game_bytes(void)
 }
 
 /* Erase-aligned weight of one cart (each region is its own flash blob). */
-static uint32_t neo_flash_game_weight(const ROM_DEF *drv)
+/* The least flash a set can take: the sprite and sample pieces of one
+ * byte value are shared (pieces_t), which is only known once the data is
+ * read, so they count as one piece each here; a set that does not fit
+ * after all fails in the copy, with the same error. */
+static uint32_t neo_flash_min_bytes(uint32_t p, uint32_t m, uint32_t v,
+                                    uint32_t sfix, uint32_t tiles)
 {
-    uint32_t p = drv->romsize[REGION_MAIN_CPU_CARTRIDGE];
-    uint32_t m = drv->romsize[REGION_AUDIO_CPU_CARTRIDGE];
-    uint32_t v = drv->romsize[REGION_AUDIO_DATA_1];
-    uint32_t tiles = drv->romsize[REGION_SPRITES];
-    uint32_t sfix = drv->romsize[REGION_FIXED_LAYER_CARTRIDGE];
     uint32_t gfix = sfix >> 5;
     uint32_t spr = (tiles >> 11) * 4u;
 
-    return flash_align_erase(p) + flash_align_erase(m) + flash_align_erase(v) +
+    return flash_align_erase(p) + flash_align_erase(m) +
+           flash_align_erase(v < NEO_PIECE ? v : NEO_PIECE) +
            flash_align_erase(sfix) + flash_align_erase(gfix) +
-           flash_align_erase(tiles) + flash_align_erase(spr);
+           flash_align_erase(tiles < NEO_PIECE ? tiles : NEO_PIECE) +
+           flash_align_erase(spr);
+}
+
+static uint32_t neo_flash_game_weight(const ROM_DEF *drv)
+{
+    return neo_flash_min_bytes(drv->romsize[REGION_MAIN_CPU_CARTRIDGE],
+                               drv->romsize[REGION_AUDIO_CPU_CARTRIDGE],
+                               drv->romsize[REGION_AUDIO_DATA_1],
+                               drv->romsize[REGION_FIXED_LAYER_CARTRIDGE],
+                               drv->romsize[REGION_SPRITES]);
 }
 #endif /* !HOST_BUILD */
 
@@ -1011,7 +1033,18 @@ static void stream_abort(flash_stream_t *st)
  * first missing one (a lookup marks a piece in use: one looked up past a
  * gap could block the run the rebuilt ones need). The bytes are then
  * produced from the start again; pieces_append drops the ones of pieces
- * already cached and stores the rest, one stream at a time. */
+ * already cached and stores the rest, one stream at a time.
+ *
+ * A piece of one byte value throughout (unprogrammed EPROM space: mslug4's
+ * sprites have 12.5 MiB of 0x00 and 0xFF pieces, preisle2's 4 MiB) is not
+ * stored with the region: every such piece of every game points to one
+ * shared blob of that value ("neogeo/fill/<value>.<size>"). A piece is
+ * only written once a byte differs, so a fill piece costs no flash write.
+ * The region's map blob ("<key>.map", one 16-bit entry a piece: the value,
+ * or PIECE_OWN) says which pieces are shared, for the launches after; a
+ * region without fill pieces has none. */
+#define PIECE_OWN 0xffffu
+
 typedef struct {
     flash_stream_t st;
     char key[48];
@@ -1019,7 +1052,12 @@ typedef struct {
     int n, first_write, cur;          /* cur: the piece being stored, or -1 */
     const uint8_t **piece;            /* cap entries: the caller's table */
     int cap;
+    uint16_t *map;                    /* split regions: fill pieces allowed */
+    int open, fill, any_fill;         /* fill: the current piece's value, -1 none yet */
+    uint32_t fill_len;                /* its bytes so far, all `fill`, not written */
 } pieces_t;
+
+static uint16_t s_map_c[NEO_TILE_PIECES], s_map_v[NEO_PCM_PIECES];
 
 /* a region's table: the read tables themselves for C and V
  * (neo_pieces.h), one entry for a region cached whole */
@@ -1029,6 +1067,10 @@ static void pieces_init(pieces_t *pw, const uint8_t **table, int cap)
     pw->piece = table;
     pw->cap = cap;
     pw->cur = -1;
+    if (table == neo_tile_piece)
+        pw->map = s_map_c;
+    else if (table == neo_pcm_piece)
+        pw->map = s_map_v;
 }
 
 static uint32_t pieces_size(const pieces_t *pw, int i)
@@ -1046,10 +1088,53 @@ static void pieces_key(const pieces_t *pw, int i, char *out, size_t out_sz)
         snprintf(out, out_sz, "%s.%d", pw->key, i);
 }
 
+static void fill_key(int value, uint32_t size, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "neogeo/fill/%02x.%u", value & 0xff, (unsigned)size);
+}
+
+static uint8_t s_fill[256];
+
+static int append_fill(flash_stream_t *st, int value, uint32_t n)
+{
+    memset(s_fill, value, sizeof(s_fill));
+    while (n) {
+        uint32_t k = n < sizeof(s_fill) ? n : (uint32_t)sizeof(s_fill);
+        if (!append_bytes(st, s_fill, k))
+            return 0;
+        n -= k;
+    }
+    return 1;
+}
+
+/* the shared blob of `size` bytes of `value`: cached, or stored now */
+static const uint8_t *fill_blob(int value, uint32_t size)
+{
+    char k[48];
+    uint32_t got = 0;
+    const uint8_t *hit;
+    flash_stream_t st;
+
+    fill_key(value, size, k, sizeof(k));
+    hit = lookup_data_in_flash(k, &got);
+    if (hit && got == size)
+        return hit;
+    memset(&st, 0, sizeof(st));
+    if (!stream_begin(&st, k, size))
+        return NULL;
+    if (!append_fill(&st, value, size)) {
+        stream_abort(&st);
+        return NULL;
+    }
+    return stream_finish(&st);
+}
+
 /* 1 when every piece is cached */
 static int pieces_lookup(pieces_t *pw, const char *key, uint32_t total, int split)
 {
     int i;
+    const uint16_t *m = NULL;
+
     pieces_init(pw, pw->piece, pw->cap);
     snprintf(pw->key, sizeof(pw->key), "%s", key);
     pw->total = total;
@@ -1059,20 +1144,73 @@ static int pieces_lookup(pieces_t *pw, const char *key, uint32_t total, int spli
         pw->n = 0;                    /* larger than the address space */
         return 0;
     }
+    if (pw->psize >= pw->total)
+        pw->map = NULL;               /* one blob: nothing to share */
+    if (pw->map) {
+        char k[64];
+        uint32_t got = 0;
+        const uint8_t *hit;
+        snprintf(k, sizeof(k), "%s.map", key);
+        hit = lookup_data_in_flash(k, &got);
+        if (hit && got == (uint32_t)pw->n * 2u)
+            m = (const uint16_t *)hit;
+    }
     for (i = 0; i < pw->n; i++)
         pw->piece[i] = NULL;
     for (i = 0; i < pw->n; i++) {
         char k[64];
-        uint32_t got = 0;
+        uint32_t got = 0, want = pieces_size(pw, i);
         const uint8_t *hit;
-        pieces_key(pw, i, k, sizeof(k));
+        if (m && m[i] != PIECE_OWN)
+            fill_key(m[i], want, k, sizeof(k));
+        else
+            pieces_key(pw, i, k, sizeof(k));
         hit = lookup_data_in_flash(k, &got);
-        if (!hit || got != pieces_size(pw, i))
+        if (!hit || got != want)
             break;
         pw->piece[i] = hit;
+        if (pw->map) {
+            pw->map[i] = m ? m[i] : PIECE_OWN;
+            if (pw->map[i] != PIECE_OWN)
+                pw->any_fill = 1;
+        }
     }
     pw->first_write = i;
     return i == pw->n;
+}
+
+/* all n bytes equal to v */
+static int all_bytes(const uint8_t *p, uint32_t n, uint8_t v)
+{
+    uint32_t w = v * 0x01010101u;
+    while (n && ((uintptr_t)p & 3u)) {
+        if (*p++ != v)
+            return 0;
+        n--;
+    }
+    for (; n >= 4; n -= 4, p += 4)
+        if (*(const uint32_t *)p != w)
+            return 0;
+    while (n--)
+        if (*p++ != v)
+            return 0;
+    return 1;
+}
+
+static int piece_open(pieces_t *pw, int i)
+{
+    char k[64];
+    pieces_key(pw, i, k, sizeof(k));
+    memset(&pw->st, 0, sizeof(pw->st));
+    if (!stream_begin(&pw->st, k, pieces_size(pw, i))) {
+        zip_set_err("ROM too large for flash");
+        return 0;
+    }
+    pw->open = 1;
+    if (pw->fill_len && !append_fill(&pw->st, pw->fill, pw->fill_len))
+        return 0;
+    pw->fill_len = 0;
+    return 1;
 }
 
 static int pieces_append(pieces_t *pw, const uint8_t *buf, uint32_t len)
@@ -1087,24 +1225,39 @@ static int pieces_append(pieces_t *pw, const uint8_t *buf, uint32_t len)
             return 0;
         if (i >= pw->first_write) {
             if (pw->cur != i) {
-                char k[64];
-                pieces_key(pw, i, k, sizeof(k));
-                memset(&pw->st, 0, sizeof(pw->st));
-                if (!stream_begin(&pw->st, k, pieces_size(pw, i))) {
-                    zip_set_err("ROM too large for flash");
-                    return 0;
-                }
                 pw->cur = i;
+                pw->open = 0;
+                pw->fill = -1;
+                pw->fill_len = 0;
+                if (!pw->map && !piece_open(pw, i))
+                    return 0;
             }
-            if (!append_bytes(&pw->st, buf, take))
+            if (!pw->open) {
+                if (pw->fill < 0)
+                    pw->fill = buf[0];
+                if (all_bytes(buf, take, (uint8_t)pw->fill))
+                    pw->fill_len += take;
+                else if (!piece_open(pw, i))
+                    return 0;
+            }
+            if (pw->open && !append_bytes(&pw->st, buf, take))
                 return 0;
         }
         pw->done += take;
         buf += take;
         len -= take;
         if (pw->done == end && pw->cur == i) {
-            pw->piece[i] = stream_finish(&pw->st);
+            if (pw->open) {
+                pw->piece[i] = stream_finish(&pw->st);
+                if (pw->map)
+                    pw->map[i] = PIECE_OWN;
+            } else {
+                pw->piece[i] = fill_blob(pw->fill, pieces_size(pw, i));
+                pw->map[i] = (uint16_t)pw->fill;
+                pw->any_fill = 1;
+            }
             pw->cur = -1;
+            pw->open = 0;
             if (!pw->piece[i]) {
                 zip_set_err("flash finish failed");
                 return 0;
@@ -1116,13 +1269,15 @@ static int pieces_append(pieces_t *pw, const uint8_t *buf, uint32_t len)
 
 static void pieces_abort(pieces_t *pw)
 {
-    if (pw->cur >= 0)
+    if (pw->cur >= 0 && pw->open)
         stream_abort(&pw->st);
     pw->cur = -1;
+    pw->open = 0;
 }
 
-/* 1 when all pieces are stored or cached */
-static int pieces_complete(const pieces_t *pw)
+/* 1 when all pieces are stored or cached; stores the map of a region
+ * rebuilt with fill pieces */
+static int pieces_complete(pieces_t *pw)
 {
     int i;
     if (pw->done != pw->total && pw->first_write < pw->n)
@@ -1130,6 +1285,19 @@ static int pieces_complete(const pieces_t *pw)
     for (i = 0; i < pw->n; i++)
         if (!pw->piece[i])
             return 0;
+    if (pw->map && pw->any_fill && pw->first_write < pw->n) {
+        char k[64];
+        flash_stream_t st;
+        snprintf(k, sizeof(k), "%s.map", pw->key);
+        memset(&st, 0, sizeof(st));
+        if (!stream_begin(&st, k, (uint32_t)pw->n * 2u) ||
+            !append_bytes(&st, pw->map, (uint32_t)pw->n * 2u) ||
+            !stream_finish(&st)) {
+            stream_abort(&st);
+            zip_set_err("ROM too large for flash");
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -1289,30 +1457,44 @@ static int ensure_sfix(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
     if (!prog_next_file(sname))
         return 0;
 
-    sfix_buf = (uint8_t *)ram_malloc(sfix_sz);
-    gfix_usage = (uint8_t *)ram_calloc(1, gfix_sz);
-    if (!sfix_buf || !gfix_usage) {
-        zip_set_err("OOM staging sfix");
-        return 0;
-    }
-
-    fs = zip_open_member(z, sname, scrc);
-    if (!fs || !zip_read_fully(fs, sfix_buf, sfix_sz)) {
-        if (fs)
+    /* In blocks: the CMC sets' 512 KiB fix layer does not fit ram_emu at
+     * once, and the conversion is per 32-byte character. */
+    {
+        uint32_t blk = sfix_sz < SFIX_BLOCK ? sfix_sz : SFIX_BLOCK, off, n;
+        sfix_buf = (uint8_t *)ram_malloc(blk);
+        gfix_usage = (uint8_t *)ram_calloc(1, gfix_sz);
+        if (!sfix_buf || !gfix_usage) {
+            zip_set_err("OOM staging sfix");
+            return 0;
+        }
+        fs = zip_open_member(z, sname, scrc);
+        if (!fs) {
+            zip_set_err("sfix open failed");
+            return 0;
+        }
+        memset(&st, 0, sizeof(st));
+        if (!stream_begin(&st, key_s, sfix_sz)) {
             neo_zip_fclose(fs);
-        zip_set_err(fs ? "sfix read failed" : "sfix open failed");
-        return 0;
-    }
-    neo_zip_fclose(fs);
-    /* Convert is quick vs flash; attribute progress to the store below. */
-    convert_sfix_inplace(sfix_buf, (int)sfix_sz, gfix_usage);
-
-    memset(&st, 0, sizeof(st));
-    if (!stream_begin(&st, key_s, sfix_sz) ||
-        !append_bytes(&st, sfix_buf, sfix_sz)) {
-        stream_abort(&st);
-        zip_set_err("ROM too large for flash");
-        return 0;
+            zip_set_err("ROM too large for flash");
+            return 0;
+        }
+        for (off = 0; off < sfix_sz; off += n) {
+            n = sfix_sz - off < blk ? sfix_sz - off : blk;
+            if (!zip_read_fully(fs, sfix_buf, n)) {
+                neo_zip_fclose(fs);
+                stream_abort(&st);
+                zip_set_err("sfix read failed");
+                return 0;
+            }
+            convert_sfix_inplace(sfix_buf, (int)n, gfix_usage + (off >> 5));
+            if (!append_bytes(&st, sfix_buf, n)) {
+                neo_zip_fclose(fs);
+                stream_abort(&st);
+                zip_set_err("ROM too large for flash");
+                return 0;
+            }
+        }
+        neo_zip_fclose(fs);
     }
     hit_s = stream_finish(&st);
     if (!hit_s) {
@@ -1750,7 +1932,7 @@ int neo_zip_flash_load(const char *zip_path)
                (unsigned)s_prog_done, (unsigned)s_prog_total,
                (unsigned)s_prog_steps);
         if (max_game && weight > max_game) {
-            printf("neo_zip: game needs %u bytes, max %u "
+            printf("neo_zip: game needs at least %u bytes, max %u "
                    "(usable=%u bios+ro reserved)\n",
                    (unsigned)weight, (unsigned)max_game,
                    (unsigned)flash_cache_usable_size());
@@ -1983,25 +2165,34 @@ static int neo_ensure_sfix(FILE *f, const char *stem, uint32_t file_off,
         zip_set_err("neo sfix seek");
         return 0;
     }
-    sfix_buf = (uint8_t *)ram_malloc(sfix_sz);
-    gfix_usage = (uint8_t *)ram_malloc(gfix_sz);
-    if (!sfix_buf || !gfix_usage) {
-        zip_set_err("OOM staging sfix");
-        return 0;
-    }
-    memset(gfix_usage, 0, gfix_sz);
-    if (!neo_read_fully(f, sfix_buf, sfix_sz)) {
-        zip_set_err("neo sfix read");
-        return 0;
-    }
-    convert_sfix_inplace(sfix_buf, (int)sfix_sz, gfix_usage);
-
-    memset(&st, 0, sizeof(st));
-    if (!stream_begin(&st, key_s, sfix_sz) ||
-        !append_bytes(&st, sfix_buf, sfix_sz)) {
-        stream_abort(&st);
-        zip_set_err("ROM too large for flash");
-        return 0;
+    /* In blocks, as ensure_sfix (zip). */
+    {
+        uint32_t blk = sfix_sz < SFIX_BLOCK ? sfix_sz : SFIX_BLOCK, off, n;
+        sfix_buf = (uint8_t *)ram_malloc(blk);
+        gfix_usage = (uint8_t *)ram_calloc(1, gfix_sz);
+        if (!sfix_buf || !gfix_usage) {
+            zip_set_err("OOM staging sfix");
+            return 0;
+        }
+        memset(&st, 0, sizeof(st));
+        if (!stream_begin(&st, key_s, sfix_sz)) {
+            zip_set_err("ROM too large for flash");
+            return 0;
+        }
+        for (off = 0; off < sfix_sz; off += n) {
+            n = sfix_sz - off < blk ? sfix_sz - off : blk;
+            if (!neo_read_fully(f, sfix_buf, n)) {
+                stream_abort(&st);
+                zip_set_err("neo sfix read");
+                return 0;
+            }
+            convert_sfix_inplace(sfix_buf, (int)n, gfix_usage + (off >> 5));
+            if (!append_bytes(&st, sfix_buf, n)) {
+                stream_abort(&st);
+                zip_set_err("ROM too large for flash");
+                return 0;
+            }
+        }
     }
     hit_s = stream_finish(&st);
     if (!hit_s) {
@@ -2227,14 +2418,10 @@ int neo_neo_flash_load(const char *neo_path)
     if (s_prog_steps) {
 #ifndef HOST_BUILD
         {
-            uint32_t weight =
-                flash_align_erase(sz.p) + flash_align_erase(sz.m) +
-                flash_align_erase(sz.v) + flash_align_erase(sz.s) +
-                flash_align_erase(gfix_sz) + flash_align_erase(sz.c) +
-                flash_align_erase(spr_sz_expect);
+            uint32_t weight = neo_flash_min_bytes(sz.p, sz.m, sz.v, sz.s, sz.c);
             uint32_t max_game = neo_flash_max_game_bytes();
             if (max_game && weight > max_game) {
-                printf("neo_neo: game needs %u bytes, max %u\n",
+                printf("neo_neo: game needs at least %u bytes, max %u\n",
                        (unsigned)weight, (unsigned)max_game);
                 zip_set_err("ROM too large for flash");
                 fclose(f);

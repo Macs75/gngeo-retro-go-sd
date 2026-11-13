@@ -1117,6 +1117,15 @@ int init_game(char *rom_name)
                 gno_set_err(neo_zip_flash_last_error());
                 return GN_FALSE;
             }
+#ifdef HOST_BUILD
+            /* NEO_LOAD_TWICE=1: load again from the cache just filled (the
+             * host's cache lives in the process): the path of every launch
+             * after the first */
+            if (getenv("NEO_LOAD_TWICE") && !neo_zip_flash_load(rom_name)) {
+                gno_set_err(neo_zip_flash_last_error());
+                return GN_FALSE;
+            }
+#endif
             reset_frame_skip();
             return GN_TRUE;
         }
@@ -1125,6 +1134,15 @@ int init_game(char *rom_name)
                 gno_set_err(neo_zip_flash_last_error());
                 return GN_FALSE;
             }
+#ifdef HOST_BUILD
+            /* NEO_LOAD_TWICE=1: load again from the cache just filled (the
+             * host's cache lives in the process): the path of every launch
+             * after the first */
+            if (getenv("NEO_LOAD_TWICE") && !neo_neo_flash_load(rom_name)) {
+                gno_set_err(neo_zip_flash_last_error());
+                return GN_FALSE;
+            }
+#endif
             reset_frame_skip();
             return GN_TRUE;
         }
