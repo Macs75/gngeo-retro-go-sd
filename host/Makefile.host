@@ -38,7 +38,11 @@ endif
 
 HOST_INC_ROOT := $(GNW_CORE_SDK)/include
 
+# Fortify off: src/porting/strings.h shadows <strings.h> and #defines bcopy,
+# which glibc's strings_fortified.h (on by default in Ubuntu's gcc at -O2)
+# cannot compile.
 HOST_DEFS := \
+	-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	-DHOST_BUILD=1 \
 	-DHOST_SDL=$(HOST_SDL) \
 	-DHOST_SCALE=$(HOST_SCALE) \

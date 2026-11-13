@@ -223,7 +223,7 @@ DECRYPT_ZIP_SRCS := \
 
 $(DECRYPT_ZIP): $(DECRYPT_ZIP_SRCS) tools/data/cmc50.xor tools/data/cmc42.xor
 	$(V)$(ECHO) [ CC ] $(DECRYPT_ZIP)
-	$(V)cc -O2 -o $@ $(DECRYPT_ZIP_SRCS) \
+	$(V)cc -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -D_GNU_SOURCE -o $@ $(DECRYPT_ZIP_SRCS) \
 		-I$(PORT) -I$(PORT)/zip -I$(GNGEO) -I$(GNGEO)/m68k -Isrc \
 		-DHAVE_CONFIG_H -DIS_LITTLE_ENDIAN -DGNGEO_DUMP_TOOL=1 \
 		-include $(PORT)/config.h

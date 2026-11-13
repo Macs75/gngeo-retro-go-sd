@@ -977,7 +977,7 @@ static int pack_zip(const char *tmpdir, const char *outpath)
 		snprintf(out_abs, sizeof(out_abs), "%s/%s", cwd, outpath);
 	}
 	snprintf(cmd, sizeof(cmd),
-		 "cd '%s' && zip -0 -q -j '%s' *", tmpdir, out_abs);
+		 "cd '%s' && zip -6 -q -j '%s' *", tmpdir, out_abs);
 	if (system(cmd) != 0) {
 		fprintf(stderr, "zip failed (is `zip` installed?)\n");
 		return 0;
