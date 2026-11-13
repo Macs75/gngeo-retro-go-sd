@@ -41,7 +41,7 @@ void wdog_refresh(void);
  * (UniBIOS + converted sfix + 000-lo). Loaded after the cart in bind, so
  * reserve them up-front when sizing a game. */
 #define NEO_BIOS_FLASH_BYTES   (0x20000u + 0x20000u + 0x10000u)
-static char zip_err[64];
+static char zip_err[160];
 
 const char *neo_zip_flash_last_error(void)
 {
@@ -439,6 +439,22 @@ static const ROM_DEF *rom_def_from_zip(neo_zip_t *z, const char *stem)
         }
     }
 
+    /* Sprite chips but no fix-layer chip: an encrypted set (CMC42/CMC50,
+     * with SMA/PVC/PCM2 on some). Its fix layer is inside the scrambled
+     * sprite chips, which the device cannot unscramble (each word moves
+     * across the whole region); tools/decrypt_neogeo_zip does it on a PC.
+     * Lines of at most 39 characters, the error screen's width. */
+    if (nc >= 2 && ns < 1) {
+        char msg[sizeof(zip_err)];
+        snprintf(msg, sizeof(msg),
+                 "This ROM is encrypted (%s.zip).\n"
+                 "Decrypt it first on a PC with\n"
+                 "tools/decrypt_neogeo_zip, then copy\n"
+                 "%s_dec.zip to /roms/neogeo/", stem, stem);
+        zip_set_err(msg);
+        printf("neo_zip: encrypted set (c=%d, no s): decrypt with tools/decrypt_neogeo_zip\n", nc);
+        return NULL;
+    }
     if (np < 1 || nm < 1 || ns < 1 || nv < 1 || nc < 2) {
         zip_set_err("zip missing p/m/s/v/c");
         printf("neo_zip: auto-detect fail p=%d m=%d s=%d v=%d c=%d\n",

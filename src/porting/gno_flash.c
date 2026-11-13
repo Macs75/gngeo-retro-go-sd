@@ -44,7 +44,7 @@ static uint32_t gno_size;
 static uint8_t vector_patch[0x80] __attribute__((aligned(16)));
 static int vector_patched;
 static char game_name_storage[16];
-static char gno_err[48];
+static char gno_err[160];
 static char neo_bios_dir[256];
 
 void neo_bios_set_dir(const char *dir)

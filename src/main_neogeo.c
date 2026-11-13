@@ -359,12 +359,16 @@ static void neo_fatal_quit(const char *line1, const char *line2)
     uint16_t *fb = lcd_get_active_buffer();
 
     if (fb) {
+        int y = 28;
         memset(fb, 0, WIDTH * HEIGHT * 2);
         if (line1)
             odroid_overlay_draw_text(8, 8, 0, (char *)line1, 0xFFFF, 0);
+        /* line2 may be several lines ('\n' or wrapped at the screen edge) */
         if (line2)
-            odroid_overlay_draw_text(8, 28, 0, (char *)line2, 0xFFFF, 0);
-        odroid_overlay_draw_text(8, 56, 0, "Press any button", 0xFFFF, 0);
+            y += odroid_overlay_draw_text(8, 28, 0, (char *)line2, 0xFFFF, 0);
+        if (y < 48)
+            y = 48;
+        odroid_overlay_draw_text(8, y + 8, 0, "Press any button", 0xFFFF, 0);
         lcd_swap();
     }
 
