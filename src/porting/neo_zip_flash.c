@@ -73,6 +73,16 @@ static void zip_set_err(const char *msg)
 
 static ROM_DEF s_auto_drv;
 
+/* Indexed sprites (tools/neo_tile_index.py, neo_pieces.h): the zip has
+ * tiles.uniq (the distinct tiles, interleaved, 128 bytes each) and
+ * tiles.index (a uint32 a tile number) instead of the sprite chips. */
+static struct {
+    int on;
+    uint32_t uniq_sz, uniq_crc, idx_sz, idx_crc;
+} s_tidx;
+#define TIDX_UNIQ "tiles.uniq"
+#define TIDX_INDEX "tiles.index"
+
 typedef struct {
     char name[32];
     uint32_t size;
@@ -394,6 +404,7 @@ static const ROM_DEF *rom_def_from_zip(neo_zip_t *z, const char *stem)
     uint32_t psz = 0, msz = 0, vsz = 0, ssz = 0, csz = 0;
 
     memset(&s_auto_drv, 0, sizeof(s_auto_drv));
+    memset(&s_tidx, 0, sizeof(s_tidx));
     {
         size_t len = stem ? strlen(stem) : 0;
         if (len >= sizeof(s_auto_drv.name))
@@ -418,6 +429,16 @@ static const ROM_DEF *rom_def_from_zip(neo_zip_t *z, const char *stem)
         int idx = 0;
         if (!neo_zip_stat(z, fi, name, sizeof(name), &sz, &crc))
             continue;
+        if (strcmp(name, TIDX_UNIQ) == 0) {
+            s_tidx.uniq_sz = sz;
+            s_tidx.uniq_crc = crc;
+            continue;
+        }
+        if (strcmp(name, TIDX_INDEX) == 0) {
+            s_tidx.idx_sz = sz;
+            s_tidx.idx_crc = crc;
+            continue;
+        }
         chip = parse_neo_chip(name, &idx);
         if (!chip)
             continue;
@@ -458,7 +479,9 @@ static const ROM_DEF *rom_def_from_zip(neo_zip_t *z, const char *stem)
         printf("neo_zip: encrypted set (c=%d, no s): decrypt with tools/decrypt_neogeo_zip\n", nc);
         return NULL;
     }
-    if (np < 1 || nm < 1 || ns < 1 || nv < 1 || nc < 2) {
+    s_tidx.on = nc == 0 && s_tidx.uniq_sz && !(s_tidx.uniq_sz & 127u) &&
+                s_tidx.idx_sz && !(s_tidx.idx_sz & 3u);
+    if (np < 1 || nm < 1 || ns < 1 || nv < 1 || (nc < 2 && !s_tidx.on)) {
         zip_set_err("zip missing p/m/s/v/c");
         printf("neo_zip: auto-detect fail p=%d m=%d s=%d v=%d c=%d\n",
                np, nm, ns, nv, nc);
@@ -505,7 +528,7 @@ static const ROM_DEF *rom_def_from_zip(neo_zip_t *z, const char *stem)
                              &msz, 0) ||
             !append_rom_files(&s_auto_drv, v, nv, REGION_AUDIO_DATA_1,
                              &vsz, 0) ||
-            !append_crom_pairs(&s_auto_drv, c, nc, &csz)) {
+            (!s_tidx.on && !append_crom_pairs(&s_auto_drv, c, nc, &csz))) {
             zip_set_err("ROM_DEF overflow");
             return NULL;
         }
@@ -515,6 +538,12 @@ static const ROM_DEF *rom_def_from_zip(neo_zip_t *z, const char *stem)
     s_auto_drv.romsize[REGION_FIXED_LAYER_CARTRIDGE] = ssz;
     s_auto_drv.romsize[REGION_AUDIO_CPU_CARTRIDGE] = msz;
     s_auto_drv.romsize[REGION_AUDIO_DATA_1] = vsz;
+    if (s_tidx.on) {
+        s_crom_split = 0;
+        csz = (s_tidx.idx_sz / 4u) * 128u;   /* every tile number */
+        printf("neo_zip: indexed sprites: %u tiles, %u distinct\n",
+               (unsigned)(s_tidx.idx_sz / 4u), (unsigned)(s_tidx.uniq_sz / 128u));
+    }
     s_auto_drv.romsize[REGION_SPRITES] = csz;
 
     printf("neo_zip: auto '%s' p=%u m=%u s=%u v=%u c=%u files=%u\n",
@@ -840,17 +869,22 @@ static void prog_plan(const ROM_DEF *drv, const char *stem)
     uint32_t p = drv->romsize[REGION_MAIN_CPU_CARTRIDGE];
     uint32_t m = drv->romsize[REGION_AUDIO_CPU_CARTRIDGE];
     uint32_t v = drv->romsize[REGION_AUDIO_DATA_1];
-    uint32_t tiles = drv->romsize[REGION_SPRITES];
+    uint32_t tiles = s_tidx.on ? s_tidx.uniq_sz + s_tidx.idx_sz
+                               : drv->romsize[REGION_SPRITES];
     uint32_t sfix = drv->romsize[REGION_FIXED_LAYER_CARTRIDGE];
     uint32_t gfix = sfix >> 5;
-    uint32_t spr = (tiles >> 11) * 4u;
+    uint32_t spr = s_tidx.on ? ((s_tidx.uniq_sz / 128u + 15u) >> 4) * 4u
+                             : (tiles >> 11) * 4u;
     /* A lookup marks a blob in use for the whole session, and the firmware
      * never erases one in use. So until the program and the tiles are known
      * to be cached (stored first, see neo_zip_flash_load), the other blobs
      * are not looked up here: a copy cached by an earlier try would block
      * runs those need. They are counted as to-do, and credited if found. */
     int hit_p = key_hit(stem, "p2", p, NULL);
-    int hit_c = hit_p && key_hit_pieces(stem, "c", tiles, NULL) &&
+    int hit_c = hit_p &&
+                (s_tidx.on ? key_hit_pieces(stem, "cu", s_tidx.uniq_sz, NULL) &&
+                             key_hit_pieces(stem, "ci", s_tidx.idx_sz, NULL)
+                           : key_hit_pieces(stem, "c", tiles, NULL)) &&
                 key_hit(stem, "spr", spr, NULL);
     int hit_m = hit_c && key_hit(stem, "m", m, NULL);
     int hit_v = hit_c && key_hit_pieces(stem, "v", v, NULL);
@@ -892,9 +926,10 @@ static void prog_plan(const ROM_DEF *drv, const char *stem)
     if (hit_c)
         s_prog_done += tiles + spr;
     else {
-        /* One step per CROM plane (even+odd) + spr_usage. */
+        /* One step per CROM plane (even+odd) + spr_usage; indexed: the
+         * distinct tiles, the index, spr_usage. */
         s_prog_steps = (uint8_t)(s_prog_steps +
-            count_rom_files(drv, REGION_SPRITES) + 1);
+            (s_tidx.on ? 3 : count_rom_files(drv, REGION_SPRITES) + 1));
     }
 
     if (s_prog_done > s_prog_total)
@@ -1003,6 +1038,12 @@ static uint32_t neo_flash_min_bytes(uint32_t p, uint32_t m, uint32_t v,
 
 static uint32_t neo_flash_game_weight(const ROM_DEF *drv)
 {
+    if (s_tidx.on)            /* distinct tiles: none of one value to share */
+        return neo_flash_min_bytes(drv->romsize[REGION_MAIN_CPU_CARTRIDGE],
+                                   drv->romsize[REGION_AUDIO_CPU_CARTRIDGE],
+                                   drv->romsize[REGION_AUDIO_DATA_1],
+                                   drv->romsize[REGION_FIXED_LAYER_CARTRIDGE], 0) +
+               flash_align_erase(s_tidx.uniq_sz) + flash_align_erase(s_tidx.idx_sz);
     return neo_flash_min_bytes(drv->romsize[REGION_MAIN_CPU_CARTRIDGE],
                                drv->romsize[REGION_AUDIO_CPU_CARTRIDGE],
                                drv->romsize[REGION_AUDIO_DATA_1],
@@ -1664,8 +1705,125 @@ static int stream_crom_pair(neo_zip_t *z, const char *even_name, uint32_t even_c
     return 1;
 }
 
+/* Indexed sprites (s_tidx): the distinct tiles as pieces "cu" (converted
+ * like any tiles, their pen usage in "spr", by distinct tile), and the
+ * index as pieces "ci", read by draw_screen. */
+static int stream_member_pieces(neo_zip_t *z, const char *name, uint32_t crc,
+                                uint32_t size, uint32_t *spr_usage, pieces_t *pw)
+{
+    neo_zip_file_t *f;
+    uint32_t block, left = size, tileno = 0;
+    uint8_t *buf = crom_block_alloc(2u, &block);   /* 2 x a 64-multiple */
+
+    if (!buf)
+        return 0;
+    block *= 2u;                                   /* a multiple of 128 */
+    if (!prog_next_file(name))
+        return 0;
+    f = zip_open_member(z, name, crc);
+    if (!f) {
+        zip_set_err("zip member missing");
+        return 0;
+    }
+    while (left) {
+        uint32_t n = left > block ? block : left;
+        int ok;
+        if (neo_zip_fread(f, buf, (int)n) != (int)n) {
+            neo_zip_fclose(f);
+            zip_set_err("tiles short read");
+            return 0;
+        }
+        ok = spr_usage ? crom_put_tiles(buf, n, &tileno, spr_usage, pw)
+                       : pieces_append(pw, buf, n);
+        if (!ok || !prog_bump(n)) {
+            neo_zip_fclose(f);
+            if (!zip_err[0])
+                zip_set_err("tile append failed");
+            return 0;
+        }
+        left -= n;
+    }
+    neo_zip_fclose(f);
+    return 1;
+}
+
+static int ensure_tiles_indexed(neo_zip_t *z, const char *stem, pieces_t *pc,
+                                pieces_t *pi, const uint8_t **spr_out,
+                                uint32_t *spr_sz)
+{
+    char key_c[48], key_i[48], key_spr[48];
+    uint32_t uniq = s_tidx.uniq_sz / 128u;
+    uint32_t spr_usage_sz = ((uniq + 15u) >> 4) * 4u;
+    uint32_t got_spr = 0;
+    const uint8_t *hit_spr;
+    uint32_t *spr_usage;
+    flash_stream_t st;
+    int all_c, all_i;
+
+    make_key(key_c, sizeof(key_c), stem, "cu", NULL);
+    make_key(key_i, sizeof(key_i), stem, "ci", NULL);
+    make_key(key_spr, sizeof(key_spr), stem, "spr", NULL);
+    all_c = pieces_lookup(pc, key_c, s_tidx.uniq_sz, 1);
+    all_i = pieces_lookup(pi, key_i, s_tidx.idx_sz, 1);
+    if (!pc->n || !pi->n) {
+        zip_set_err("ROM too large for flash");
+        return 0;
+    }
+    hit_spr = lookup_data_in_flash(key_spr, &got_spr);
+    if (all_c && all_i && hit_spr && got_spr == spr_usage_sz) {
+        *spr_out = hit_spr;
+        *spr_sz = got_spr;
+        return 1;
+    }
+
+    spr_usage = (uint32_t *)ram_calloc(1, spr_usage_sz);
+    if (!spr_usage) {
+        zip_set_err("OOM staging spr");
+        return 0;
+    }
+    if (!stream_member_pieces(z, TIDX_UNIQ, s_tidx.uniq_crc, s_tidx.uniq_sz,
+                              spr_usage, pc) ||
+        !pieces_complete(pc)) {
+        pieces_abort(pc);
+        if (!zip_err[0])
+            zip_set_err("tiles finish failed");
+        return 0;
+    }
+    if (!stream_member_pieces(z, TIDX_INDEX, s_tidx.idx_crc, s_tidx.idx_sz,
+                              NULL, pi) ||
+        !pieces_complete(pi)) {
+        pieces_abort(pi);
+        if (!zip_err[0])
+            zip_set_err("index finish failed");
+        return 0;
+    }
+
+    if (!prog_next_file("spr"))
+        return 0;
+    memset(&st, 0, sizeof(st));
+    if (!stream_begin(&st, key_spr, spr_usage_sz) ||
+        !append_bytes(&st, spr_usage, spr_usage_sz)) {
+        stream_abort(&st);
+        zip_set_err("ROM too large for flash");
+        return 0;
+    }
+    hit_spr = stream_finish(&st);
+    if (!hit_spr) {
+        zip_set_err("spr finish failed");
+        return 0;
+    }
+    if (!prog_bump(spr_usage_sz))
+        return 0;
+    printf("neo_zip: cached %s (%d pieces) + %s (%d pieces) + %s\n",
+           key_c, pc->n, key_i, pi->n, key_spr);
+    *spr_out = hit_spr;
+    *spr_sz = spr_usage_sz;
+    return 1;
+}
+
 static int ensure_tiles(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
-                        pieces_t *pc, const uint8_t **spr_out, uint32_t *spr_sz)
+                        pieces_t *pc, pieces_t *pi,
+                        const uint8_t **spr_out, uint32_t *spr_sz)
 {
     char key_c[48], key_spr[48];
     uint32_t tiles = drv->romsize[REGION_SPRITES];
@@ -1682,6 +1840,9 @@ static int ensure_tiles(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
     } crom_pair_t;
     crom_pair_t pairs[8];
     int np = 0;
+
+    if (s_tidx.on)
+        return ensure_tiles_indexed(z, stem, pc, pi, spr_out, spr_sz);
 
     make_key(key_c, sizeof(key_c), stem, "c", NULL);
     make_key(key_spr, sizeof(key_spr), stem, "spr", NULL);
@@ -1879,12 +2040,13 @@ int neo_zip_flash_load(const char *zip_path)
     uint32_t s_sz, g_sz, spr_sz;
     uint32_t scratch_need;
     static const uint8_t *p_piece[1], *m_piece[1];
-    pieces_t pp, pm, pv, pc;
+    pieces_t pp, pm, pv, pc, pi;
 
     pieces_init(&pp, p_piece, 1);
     pieces_init(&pm, m_piece, 1);
     pieces_init(&pv, neo_pcm_piece, (int)NEO_PCM_PIECES);
     pieces_init(&pc, neo_tile_piece, (int)NEO_TILE_PIECES);
+    pieces_init(&pi, neo_tidx_piece, (int)NEO_TIDX_PIECES);
 
     zip_err[0] = 0;
     if (!zip_path || !zip_path[0]) {
@@ -1967,7 +2129,7 @@ int neo_zip_flash_load(const char *zip_path)
      * staging is taken. */
     if (!ensure_raw_region(z, drv, stem, "p2", REGION_MAIN_CPU_CARTRIDGE,
                            drv->romsize[REGION_MAIN_CPU_CARTRIDGE], 0, &pp) ||
-        !ensure_tiles(z, drv, stem, &pc, &spr, &spr_sz)) {
+        !ensure_tiles(z, drv, stem, &pc, &pi, &spr, &spr_sz)) {
         printf("neo_zip: fail p/tiles: %s (RAM free=%u)\n",
                zip_err, (unsigned)ram_get_free_size());
         neo_zip_close(z);
@@ -2004,9 +2166,10 @@ int neo_zip_flash_load(const char *zip_path)
         prog_finish();
 
     neo_rom_set_pieces(pc.n, pv.n);
+    neo_rom_set_tile_index(s_tidx.on ? pi.n : 0);
     if (!neo_rom_bind_regions(game_id, pp.piece[0], pp.total, pm.piece[0], pm.total,
                               pv.piece[0], pv.total, s, s_sz, gfix, g_sz,
-                              pc.piece[0], pc.total, spr, spr_sz)) {
+                              pc.piece[0], drv->romsize[REGION_SPRITES], spr, spr_sz)) {
         printf("neo_zip: bind failed: %s\n", gno_flash_last_error());
         zip_set_err(gno_flash_last_error());
         return 0;

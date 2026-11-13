@@ -44,6 +44,8 @@
 
 /* the sprite tiles' pieces (neo_pieces.h; set by neo_rom_bind_regions) */
 const uint8_t *neo_tile_piece[NEO_TILE_PIECES];
+const uint8_t *neo_tidx_piece[NEO_TIDX_PIECES];
+int neo_tile_indexed;
 
 extern int neogeo_fix_bank_type;
 unsigned int neogeo_frame_counter;
@@ -1087,6 +1089,8 @@ void draw_screen(void) {
 			if (sx >= -16 && sx < 320 &&
 			    sy > -16 && sy < buffer->h) {
 
+				if (neo_tile_indexed)
+					tileno = neo_tile_unique(tileno);
 				penusage = PEN_USAGE(tileno);
 				if (memory.vid.spr_cache.data) {
 					memory.rom.tiles.p = get_cached_sprite_ptr(tileno);
@@ -1268,6 +1272,8 @@ void draw_screen_scanline(int start_line, int end_line, int refresh) {
 			if (!memory.rom.tiles.p || memory.nb_of_tiles == 0)
 				continue;
 			tileno %= memory.nb_of_tiles;
+			if (neo_tile_indexed)
+				tileno = neo_tile_unique(tileno);
 
 			penusage = PEN_USAGE(tileno);
 			if (memory.vid.spr_cache.data) {

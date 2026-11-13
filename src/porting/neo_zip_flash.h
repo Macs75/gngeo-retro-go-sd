@@ -26,3 +26,8 @@ int neo_rom_bind_regions(const char *game_id,
  * the bind fills the rest of both tables. Without it (a .gno), the bind
  * takes c and v as whole regions. */
 void neo_rom_set_pieces(int c_n, int v_n);
+
+/* Before neo_rom_bind_regions, for indexed sprites (neo_pieces.h): the
+ * loader has stored the index's idx_n pieces in neo_tidx_piece; c of the
+ * bind is then the distinct tiles, c_sz the size of every tile number. */
+void neo_rom_set_tile_index(int idx_n);

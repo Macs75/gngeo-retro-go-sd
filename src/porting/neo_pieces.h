@@ -33,6 +33,22 @@ extern const uint8_t *neo_tile_piece[NEO_TILE_PIECES];
 extern const uint8_t *neo_pcm_piece[NEO_PCM_PIECES];
 extern const uint8_t *neo_pcmb_piece[NEO_PCM_PIECES];
 
+/*
+ * Indexed sprites (a set too big for the cache whose sprites repeat tiles;
+ * tools/neo_tile_index.py): the distinct tiles are the region above, and
+ * an index, in pieces too, gives each tile number its distinct tile.
+ * draw_screen translates a tile number once, before its pen usage and its
+ * draw; neo_tile_indexed is 0 for every other set.
+ */
+#define NEO_TIDX_PIECES 8u                      /* 1M tiles: 128 MiB */
+extern const uint8_t *neo_tidx_piece[NEO_TIDX_PIECES];
+extern int neo_tile_indexed;
+
+static inline uint32_t neo_tile_unique(uint32_t tileno)
+{
+    return ((const uint32_t *)neo_tidx_piece[tileno >> 17])[tileno & 0x1ffffu];
+}
+
 static inline const uint8_t *neo_tile_data(uint32_t tileno)
 {
     return neo_tile_piece[tileno >> (NEO_PIECE_SHIFT - 7u)] +

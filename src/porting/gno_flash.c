@@ -752,12 +752,17 @@ static void apply_bios_vectors(GAME_ROMS *r)
 
 /* the loader's piece counts for the next bind (neo_rom_set_pieces): its
  * pieces are already in neo_tile_piece / neo_pcm_piece */
-static int bind_c_n, bind_v_n;
+static int bind_c_n, bind_v_n, bind_tidx_n;
 
 void neo_rom_set_pieces(int c_n, int v_n)
 {
     bind_c_n = c_n < (int)NEO_TILE_PIECES ? c_n : (int)NEO_TILE_PIECES;
     bind_v_n = v_n < (int)NEO_PCM_PIECES ? v_n : (int)NEO_PCM_PIECES;
+}
+
+void neo_rom_set_tile_index(int idx_n)
+{
+    bind_tidx_n = idx_n;
 }
 
 /* The piece tables (neo_pieces.h): the loader's pieces, else addresses
@@ -793,7 +798,9 @@ static void bind_pieces(const uint8_t *c, uint32_t c_sz,
         n = NEO_PCM_PIECES;
     for (k = 0; k < NEO_PCM_PIECES; k++)
         neo_pcmb_piece[k] = (!vb || vb == v) ? neo_pcm_piece[k] : vb + (k % n) * NEO_PIECE;
-    bind_c_n = bind_v_n = 0;
+    /* indexed sprites only when the loader stored an index for this bind */
+    neo_tile_indexed = bind_tidx_n > 0;
+    bind_c_n = bind_v_n = bind_tidx_n = 0;
 }
 
 int neo_rom_bind_regions(const char *game_id,
@@ -852,7 +859,8 @@ int neo_rom_bind_regions(const char *game_id,
     if (getenv("NEO_BLOB_SUM")) {
         uint64_t h = 1469598103934665603ull;
         for (uint32_t i = 0; i < r->tiles.size; i++)
-            h = (h ^ neo_tile_data(i >> 7)[i & 127]) * 1099511628211ull;
+            h = (h ^ neo_tile_data(neo_tile_indexed ? neo_tile_unique(i >> 7) : i >> 7)[i & 127]) *
+                1099511628211ull;
         printf("READSUM tiles %u %016llx\n", (unsigned)r->tiles.size, (unsigned long long)h);
         h = 1469598103934665603ull;
         for (uint32_t i = 0; i < r->adpcma.size; i++)
