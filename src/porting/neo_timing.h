@@ -33,5 +33,8 @@ int neo_timing_rate(void);
 int neo_timing_spf(void);
 /* the frame rate the loop runs at, in milli-Hz (rate / samples per frame) */
 uint32_t neo_timing_frame_mhz(void);
+/* before every common_emu_frame_loop(): the firmware pacer's frame time for
+ * this frame (whole 10 us units whose mean is the exact frame time) */
+void neo_timing_frame_tick(void);
 
 #endif

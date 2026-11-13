@@ -20,12 +20,33 @@
 - A missing .gno file is reported as "ROM file not found", a failed
   flash cache as "ROM caching failed" (both said "ROM too large for
   flash").
+- One picture dropped once per session, ~70-106 s in (every device log
+  longer than that: neodrift, fightfev, pspikes2, mslug2, sengoku3; a
+  window ~14 ms short with vskip=1, never load). The
+  firmware's pacer (common_emu_frame_loop) sums the measured frame time
+  minus frame_time_10us and, past one frame, sets skip_frames, which also
+  skips that frame's audio wait; the core set frame_time_10us to a rounded
+  1679 for a 1679.40 frame (AES), so the sum drifted one frame in ~4,200
+  frames. It now gets whole units chosen frame by frame whose mean is the
+  exact frame time (simulated: under 4 units after 420,000 frames).
+  Device, sengoku3_2: 8,760 of 8,760 frames drawn over 151 s.
 - An encrypted MAME zip (sprite chips but no fix-layer chip: the CMC42/
   CMC50 sets, e.g. sengoku3, kof99, garou, mslug3) is reported as
   encrypted, with the PC tool to decrypt it (tools/decrypt_neogeo_zip)
   and the name to copy (<game>_dec.zip), before anything is written to
   flash; it said "zip missing p/m/s/v/c". The error screen fits a message
   of several lines.
+- A game whose sprite chips are a large share of the flash could fail to
+  cache ("ROM too large for flash") with the space free: the zip and .neo
+  loaders stored the program, sound and fix chips first, and the firmware
+  never erases a blob in use, so they could split the cache into runs too
+  short for the sprite chips, which need one contiguous run (sengoku3:
+  32 MiB after 17.4 MB, on 60 MiB). The sprite chips are stored first now,
+  when only the core's own .ro is in use, and the other blobs are not
+  looked up before that (a lookup marks a blob in use too: the copies a
+  failed try left behind blocked the run again). Reproduced on gwemu with
+  both older builds (same messages as the device), and the 32 MiB blob is
+  placed from that state with the new one.
 
 ### Changed
 

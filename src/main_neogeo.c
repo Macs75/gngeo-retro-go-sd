@@ -583,6 +583,7 @@ void app_main_neogeo(uint8_t load_state, uint8_t start_paused, int8_t save_slot)
     while (1) {
         wdog_refresh();
 
+        neo_timing_frame_tick();
         bool draw_frame = common_emu_frame_loop();
         bool can_present = draw_frame && !NEO_DISABLE_VIDEO;
 

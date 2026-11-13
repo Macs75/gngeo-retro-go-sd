@@ -41,6 +41,9 @@
 static int rate = NEO_AUDIO_RATE_SAFE, spf = 304;
 static uint32_t rate_mhz = NEO_AUDIO_RATE_SAFE * 1000u;
 static uint32_t frame_mhz = NEO_AUDIO_RATE_SAFE * 1000u / 304u;
+/* the frame time in 10 us units, 16.16 fixed point, and the fraction
+ * carried from frame to frame (neo_timing_frame_tick) */
+static uint32_t frame_q16 = 1677u << 16, frame_frac;
 
 int neo_timing_rate(void) { return rate; }
 int neo_timing_spf(void) { return spf; }
@@ -102,11 +105,29 @@ void neo_timing_apply(void)
 
     spf = (int)((rate_mhz + fps / 2) / fps);
     frame_mhz = (uint32_t)(((uint64_t)rate_mhz * 1000u / (uint32_t)spf + 500u) / 1000u);
-    common_emu_state.frame_time_10us =
-        (uint16_t)(((uint64_t)spf * 100000000u + rate_mhz / 2) / rate_mhz);
+    frame_q16 = (uint32_t)((((uint64_t)spf * 100000000u) << 16) / rate_mhz);
+    frame_frac = 0;
+    neo_timing_frame_tick();
     lcd_set_refresh_rate(frame_mhz);
     printf("neogeo: %s, audio %lu.%03lu Hz, %d samples/frame: %lu.%03lu Hz\n",
            neo_settings_hw_get() == NEO_HW_MVS ? "MVS" : "AES",
            (unsigned long)(rate_mhz / 1000u), (unsigned long)(rate_mhz % 1000u), spf,
            (unsigned long)(frame_mhz / 1000u), (unsigned long)(frame_mhz % 1000u));
+}
+
+/* The firmware's pacer (common_emu_frame_loop) sums, frame by frame, the
+ * measured frame time minus frame_time_10us, and when the sum passes one
+ * frame it sets skip_frames, which also skips that frame's audio wait
+ * (common_emu_sound_sync). frame_time_10us is whole 10 us units; the frame
+ * is not (AES at 18518.5 Hz: 1679.40). A rounded constant made the sum
+ * drift by the remainder every frame: about 70 s in, one frame ran
+ * without its audio wait, the loop got a buffer ahead and that picture was
+ * dropped (one per session in every device log over ~70 s).
+ * Whole units chosen frame by frame so their mean is the exact frame time
+ * keep the sum on real slowdowns only. */
+void neo_timing_frame_tick(void)
+{
+    frame_frac += frame_q16;
+    common_emu_state.frame_time_10us = (uint16_t)(frame_frac >> 16);
+    frame_frac &= 0xffffu;
 }
