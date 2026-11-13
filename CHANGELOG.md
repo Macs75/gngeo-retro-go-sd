@@ -232,6 +232,17 @@
 
 ### Added
 
+- tools/decrypt_neogeo_zip decrypts matrim (its decrypt function was there,
+  the set was missing from the table; checked on the host: boots, draws).
+- tools/neo_fit_report.py: whether a set fits the flash cache as is, with
+  blank pieces shared, with indexed tiles, or with indexed half-tiles (not
+  implemented). Of the sets over 60 MiB in a 138-game collection: kof97 and
+  preisle2 fit as is, lastblad, mslug4 and rbff2 with blank pieces (rbff2
+  ran as is on the device though reported at 59.5 MiB), mslugx, s1945p,
+  rotd, mslug5 with indexed tiles; half-tiles would add only shocktr2 and
+  matrim; kof98/99/2000/2001/2002/2003, garou, mslug3, svc, samsho5,
+  samsh5sp and lastbld2 do not fit in any scheme. tools/neo_tile_flips.py:
+  distinct tiles up to mirror images (kof99 and matrim: under 2% fewer).
 - tools/decrypt_neogeo_zip writes a compressed zip (deflate; it stored
   the files): sengoku3_dec 51.0 -> 20.8 MB, preisle2_dec 62.1 -> 26.7 MB.
   The cached data is the same (host NEO_BLOB_SUM=1: all 97 blobs of

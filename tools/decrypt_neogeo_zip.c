@@ -699,6 +699,7 @@ static const game_def_t games[] = {
 	{ "kof2000",  "257-p1.p1",       P_SMA_P12,   4, 0x800000, 1, 0x80000, 1, dec_kof2000,  "SMA+CMC50" },
 	{ "kof2001",  "262-p1-08-e0.p1", P_CONCAT,    4, 0x800000, 1, 0x20000, 1, dec_kof2001,  "CMC50" },
 	{ "kof2002",  "265-p1.p1",       P_CONCAT,    4, 0x800000, 1, 0x20000, 1, dec_kof2002,  "CMC50+PCM2" },
+	{ "matrim",   "266-p1.p1",       P_CONCAT,    4, 0x800000, 1, 0x20000, 1, dec_matrim,   "CMC50+PCM2" },
 	{ "mslug4",   "263-p1.p1",       P_CONCAT,    3, 0x800000, 1, 0x80000, 1, dec_mslug4,   "CMC50+PCM2" },
 	{ "rotd",     "264-p1.p1",       P_CONCAT,    4, 0x800000, 1, 0x20000, 1, dec_rotd,     "CMC50+PCM2" },
 	{ "pnyaa",    "pn202.p1",        P_CONCAT,    1, 0x800000, 1, 0x20000, 1, dec_pnyaa,    "CMC50+PCM2" },
