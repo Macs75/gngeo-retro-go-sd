@@ -59,35 +59,84 @@ static int neo_frame_irq(void)
     return 1;
 }
 
+/*
+ * The Z80 kept in step with the 68000. The frame runs the 68000, and the
+ * Z80 catches up to the 68000's time (12 MHz / 4 MHz: a third of its
+ * cycles) whenever the 68000 writes a sound command or reads the reply at
+ * $320000 (neo_z80_sync, from memory.c), then runs the rest of its frame.
+ * The YM2610 timers tick at the same NEO_Z80_SLICES boundaries as before.
+ * The Z80 used to run its whole frame first: a game that waits for the
+ * reply (s1945p: up to 10,000 polls after every sound command) spun to the
+ * end of the 68000's frame, ~half its cycles, and dropped game frames.
+ */
+uint32_t cpu_68k_slice_cycles(void);
+
+static uint32_t z80_done, z80_slice_len, z80_frame_len, m68k_carry;
+static int z80_slice, z80_in_frame;
+
+static void z80_run_to(uint32_t target)
+{
+    if (target > z80_frame_len)
+        target = z80_frame_len;
+    while (z80_slice < nb_interlace) {
+        uint32_t end = (uint32_t)(z80_slice + 1) * z80_slice_len;
+        if (z80_done < end) {
+            uint32_t to;
+            if (z80_done >= target)
+                return;
+            to = target < end ? target : end;
+            z80_done += (uint32_t)cpu_z80_run((int)(to - z80_done));
+            if (z80_done < end)
+                return;               /* reached the target inside the slice */
+        }
+        my_timer();
+        z80_slice++;
+#ifndef HOST_BUILD
+        if ((z80_slice & 7) == 0)
+            wdog_refresh();
+#endif
+    }
+}
+
+void neo_z80_sync(void)
+{
+    if (!z80_in_frame)
+        return;
+    PROFILER_STOP(PROF_68K);
+    PROFILER_START(PROF_Z80);
+    z80_run_to((m68k_carry + cpu_68k_slice_cycles()) / 3u);
+    PROFILER_STOP(PROF_Z80);
+    PROFILER_START(PROF_68K);
+}
+
 void neo_run_frame(int draw_video)
 {
-    int i;
     int a;
     Uint32 cpu_68k_timeslice = NEO_M68K_CYCLES_PER_FRAME;
-    Uint32 cpu_z80_timeslice = NEO_Z80_CYCLES_PER_FRAME;
-    Uint32 cpu_z80_timeslice_interlace = cpu_z80_timeslice / (Uint32)nb_interlace;
+    int sound = neo_sound_gen_enabled();
 
     want_draw = draw_video && !NEO_DISABLE_VIDEO;
 
     if (conf.test_switch == 1)
         conf.test_switch = 0;
 
-    if (neo_sound_gen_enabled()) {
-        PROFILER_START(PROF_Z80);
-        for (i = 0; i < nb_interlace; i++) {
-            cpu_z80_run((int)cpu_z80_timeslice_interlace);
-            my_timer();
-#ifndef HOST_BUILD
-            if ((i & 7) == 0)
-                wdog_refresh();
-#endif
-        }
-        PROFILER_STOP(PROF_Z80);
-    }
+    z80_done = 0;
+    z80_slice = 0;
+    z80_frame_len = NEO_Z80_CYCLES_PER_FRAME;
+    z80_slice_len = z80_frame_len / (Uint32)nb_interlace;
+    m68k_carry = tm_cycle;            /* run by the last frame's slice already */
+    z80_in_frame = sound;
 
     PROFILER_START(PROF_68K);
     tm_cycle = cpu_68k_run(cpu_68k_timeslice - tm_cycle);
     PROFILER_STOP(PROF_68K);
+    z80_in_frame = 0;
+
+    if (sound) {
+        PROFILER_START(PROF_Z80);
+        z80_run_to(z80_frame_len);
+        PROFILER_STOP(PROF_Z80);
+    }
     a = neo_frame_irq();
 
     memory.watchdog++;

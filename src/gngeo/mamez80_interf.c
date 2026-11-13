@@ -195,10 +195,9 @@ void cpu_z80_init(void)
     printf("z80: banked page-table RM (DTCM, no 64KiB mirror)\n");
 }
 
-void cpu_z80_run(int nbcycle)
+int cpu_z80_run(int nbcycle)
 {
-    //printf("%x\n",z80_get_reg(Z80_PC));
-    z80_execute(nbcycle);
+    return z80_execute(nbcycle);
 }
 void cpu_z80_nmi(void)
 {

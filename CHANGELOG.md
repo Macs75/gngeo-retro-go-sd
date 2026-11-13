@@ -52,6 +52,31 @@
   pspikes2 (.neo), sengoku3_dec, preisle2_dec (96 + 12 pieces), viewpoin,
   mslug2, kotm2. The host flash cache holds 256 blobs like the firmware's
   (it held 64).
+- The Z80 is kept in step with the 68000: each frame runs the 68000, and
+  the Z80 catches up to the 68000's time (a third of its cycles) whenever
+  the 68000 writes a sound command or reads the reply at $320000, then runs
+  the rest of its frame; the YM2610 timers tick at the same 16 slices. The
+  Z80 used to run its whole frame first (and 300 extra T-states after a
+  command): a game that waits for the reply spun to the end of the 68000's
+  frame. s1945p polls up to 10,000 times after every sound command: 49% of
+  its 68000 cycles in its attract were that loop, and its demo updated its
+  objects on 47-97 of 119 frames (visible stutter); now 119 of 119. All
+  emulation results change (recordings made before replay differently);
+  12 games' attract (mslug, mslug2, kof97, rbff2, samsho4, blazstar,
+  pulstar, neodrift, turfmast, aof3, lastblad, wakuwak7) at the same point
+  at frame 2,400, sound playing.
+- Indexed sprites, for a set too big for the cache whose sprites repeat
+  tiles: tools/neo_tile_index.py rewrites a zip (plain or decrypted) with
+  each distinct tile once (tiles.uniq) and an index from tile number to
+  distinct tile (tiles.index, a uint32 each); the loader caches both as
+  pieces and draw_screen translates a tile number once, before its pen
+  usage and its draw (src/porting/neo_pieces.h). rotd (decrypted): 524,288
+  tiles, 244,259 distinct, sprites 64 -> 29.8 MiB + 2 MiB index, the set
+  88.6 -> 56.5 MiB. Other sets: 3 instructions per visible tile (the flag
+  test) and one spill in draw_screen, ITCM +32 B. Host: mslug2 indexed
+  against mslug2 direct, the 4,996-frame replay's 41 state/picture/audio
+  hashes and the tiles as read identical, both loads; rotd boots and
+  draws (EVOGA logo, title, ranking).
 - A sprite or sample piece of one byte value throughout (unprogrammed
   EPROM space) is cached once for all games ("neogeo/fill/<value>.<size>")
   and shared; a region with such pieces gets a small map blob

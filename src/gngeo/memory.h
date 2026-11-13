@@ -160,7 +160,10 @@ int cpu_68k_debuger(void (*execstep)(void),void (*dump)(void));
 
 
 /* cpu z80 interface */
-void cpu_z80_run(int nbcycle);
+int cpu_z80_run(int nbcycle);
+/* Bring the Z80 up to the 68000's time in the frame (neo_frame.c): before
+ * the 68000 writes a sound command or reads the Z80's reply at $320000. */
+void neo_z80_sync(void);
 void cpu_z80_nmi(void);
 void cpu_z80_raise_irq(int l);
 void cpu_z80_lower_irq(void);

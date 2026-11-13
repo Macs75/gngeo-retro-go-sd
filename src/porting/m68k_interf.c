@@ -598,6 +598,10 @@ int cpu_68k_run(Uint32 nb_cycle)
 
 Uint32 cpu_68k_getpc(void) { return (Uint32)m68k.pc; }
 
+/* the 68000 cycles run in the current cpu_68k_run() so far (from a memory
+ * handler: neo_z80_sync) */
+Uint32 cpu_68k_slice_cycles(void) { return m68k.cycles - frame_cycle_base; }
+
 int cpu_68k_run_step(void)
 {
     unsigned int start = m68k.cycles;

@@ -428,6 +428,7 @@ Uint8 mem68k_fetch_coin_byte(Uint32 addr) {
     if (addr == 0x0) {
         int res = 0;
         if (conf.sound) {
+            neo_z80_sync();          /* its reply as of now */
             //printf("fetch coin byte, rescoe= %x\n",result_code);
 #ifdef ENABLE_940T
 
@@ -658,6 +659,7 @@ void mem68k_store_pd4990_long(Uint32 addr, Uint32 data) {
 /**** Z80 ****/
 void mem68k_store_z80_byte(Uint32 addr, Uint8 data) {
     if (addr == 0x320000) {
+        neo_z80_sync();              /* the Z80 up to now, then the command */
         sound_code = data & 0xff;
         pending_command = 1;
         //printf("B Pending command. Sound_code=%02x\n",sound_code);
@@ -680,8 +682,7 @@ void mem68k_store_z80_byte(Uint32 addr, Uint8 data) {
                 }
             }
 #else
-            cpu_z80_nmi();
-            cpu_z80_run(300);
+            cpu_z80_nmi();          /* taken when the Z80 next runs */
 #endif
         }
     }
@@ -689,6 +690,7 @@ void mem68k_store_z80_byte(Uint32 addr, Uint8 data) {
 void mem68k_store_z80_word(Uint32 addr, Uint16 data) {
     /* tpgolf use word store for sound */
     if (addr == 0x320000) {
+        neo_z80_sync();              /* the Z80 up to now, then the command */
         sound_code = data >> 8;
         pending_command = 1;
         //printf("W Pending command. Sound_code=%02x\n",sound_code);
@@ -707,8 +709,7 @@ void mem68k_store_z80_word(Uint32 addr, Uint16 data) {
                 }
             }
 #else
-            cpu_z80_nmi();
-            cpu_z80_run(300);
+            cpu_z80_nmi();          /* taken when the Z80 next runs */
 #endif
         }
     }
