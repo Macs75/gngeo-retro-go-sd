@@ -35,6 +35,7 @@
 
 #include "neo_zip_flash.h"
 #include "neo_pvc.h"
+#include "neo_pieces.h"
 
 int neogeo_fix_bank_type = 0;
 
@@ -749,6 +750,52 @@ static void apply_bios_vectors(GAME_ROMS *r)
     vector_patched = 1;
 }
 
+/* the loader's piece counts for the next bind (neo_rom_set_pieces): its
+ * pieces are already in neo_tile_piece / neo_pcm_piece */
+static int bind_c_n, bind_v_n;
+
+void neo_rom_set_pieces(int c_n, int v_n)
+{
+    bind_c_n = c_n < (int)NEO_TILE_PIECES ? c_n : (int)NEO_TILE_PIECES;
+    bind_v_n = v_n < (int)NEO_PCM_PIECES ? v_n : (int)NEO_PCM_PIECES;
+}
+
+/* The piece tables (neo_pieces.h): the loader's pieces, else addresses
+ * NEO_PIECE apart in a whole region. Samples: all four entries set, the
+ * ones past the region mirroring it (an address out of range read the
+ * flash after the region before; now it reads the region). */
+static void bind_pieces(const uint8_t *c, uint32_t c_sz,
+                        const uint8_t *v, uint32_t v_sz,
+                        const uint8_t *vb, uint32_t vb_sz)
+{
+    uint32_t k, n;
+
+    n = bind_c_n ? (uint32_t)bind_c_n : (c_sz + NEO_PIECE - 1u) >> NEO_PIECE_SHIFT;
+    for (k = 0; k < NEO_TILE_PIECES; k++)
+        if (!bind_c_n || k >= n)
+            neo_tile_piece[k] = k < n ? c + k * NEO_PIECE : c;
+
+    n = bind_v_n ? (uint32_t)bind_v_n : (v_sz + NEO_PIECE - 1u) >> NEO_PIECE_SHIFT;
+    if (!n)
+        n = 1;
+    if (n > NEO_PCM_PIECES)
+        n = NEO_PCM_PIECES;
+    for (k = 0; k < NEO_PCM_PIECES; k++) {
+        if (bind_v_n && k < n)
+            continue;                 /* the loader's piece */
+        neo_pcm_piece[k] = bind_v_n ? neo_pcm_piece[k % n] : v + (k % n) * NEO_PIECE;
+    }
+    /* ADPCM-B: the same pieces, or a separate whole region (.gno V2) */
+    n = (vb_sz + NEO_PIECE - 1u) >> NEO_PIECE_SHIFT;
+    if (!n)
+        n = 1;
+    if (n > NEO_PCM_PIECES)
+        n = NEO_PCM_PIECES;
+    for (k = 0; k < NEO_PCM_PIECES; k++)
+        neo_pcmb_piece[k] = (!vb || vb == v) ? neo_pcm_piece[k] : vb + (k % n) * NEO_PIECE;
+    bind_c_n = bind_v_n = 0;
+}
+
 int neo_rom_bind_regions(const char *game_id,
                          const uint8_t *p, uint32_t p_sz,
                          const uint8_t *m, uint32_t m_sz,
@@ -798,6 +845,21 @@ int neo_rom_bind_regions(const char *game_id,
 
     memory.fix_game_usage = r->gfix_usage.p;
     memory.nb_of_tiles = r->tiles.size >> 7;
+    bind_pieces(c, c_sz, v, v_sz, v, v_sz);
+#ifdef HOST_BUILD
+    /* NEO_BLOB_SUM=1: checksums (FNV-1a 64) of the tiles and samples as the
+     * renderer and the YM2610 read them */
+    if (getenv("NEO_BLOB_SUM")) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < r->tiles.size; i++)
+            h = (h ^ neo_tile_data(i >> 7)[i & 127]) * 1099511628211ull;
+        printf("READSUM tiles %u %016llx\n", (unsigned)r->tiles.size, (unsigned long long)h);
+        h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < r->adpcma.size; i++)
+            h = (h ^ neo_pcm_byte(i)) * 1099511628211ull;
+        printf("READSUM pcm %u %016llx\n", (unsigned)r->adpcma.size, (unsigned long long)h);
+    }
+#endif
 
     printf("neo: game=%s p=%u m=%u v=%u s=%u c=%u\n",
            game_id, (unsigned)p_sz, (unsigned)m_sz, (unsigned)v_sz,
@@ -985,6 +1047,8 @@ int gno_flash_load(const char *path)
 
     memory.fix_game_usage = r->gfix_usage.p;
     memory.nb_of_tiles = r->tiles.size >> 7;
+    bind_pieces(r->tiles.p, r->tiles.size, r->adpcma.p, r->adpcma.size,
+                r->adpcmb.p, r->adpcmb.size);
 
     /* Prefer SD /bios/neogeo (or host --bios) over regions baked into the
      * .gno so every game uses the same UniBIOS/sfix/000-lo. */

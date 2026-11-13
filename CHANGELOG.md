@@ -30,6 +30,38 @@
   frames. It now gets whole units chosen frame by frame whose mean is the
   exact frame time (simulated: under 4 units after 420,000 frames).
   Device, sengoku3_2: 8,760 of 8,760 frames drawn over 151 s.
+- The sprite tiles and the YM2610 samples are cached as 512 KiB pieces,
+  each a blob of its own (keys "<region>.<i>"; gw-arcade-core's
+  rom_xform_chunks for the same reason), and the program, the largest blob
+  still cached whole, is stored first. The flash cache stores a blob
+  contiguously, and a big set left no run long enough for a whole region
+  (preisle2: the 48 MiB sprites were placed, then no 6 MiB run for the
+  samples, with 59.35 of 59.9 MiB needed). A run too short for the next
+  piece stays empty, so the piece size bounds the waste:
+  tools/neo_flash_fit.py simulates the firmware's placement for every .ro
+  position and write pointer, preisle2 fails in 84% of them with 4 MiB
+  pieces, 43% with 1 MiB, 0.0% with 512 KiB (~110 of the cache's 256
+  entries). The renderer and the YM2610 find a byte through a table of
+  piece addresses (src/porting/neo_pieces.h; the loader stores straight
+  into it); a .gno, cached whole, fills it with addresses 512 KiB apart.
+  Cached pieces are looked up in order up to the first missing one, and
+  the rest are rebuilt. Device code: 5 instructions more per sprite tile
+  drawn (~0.4% of a tile), the pixel loops and the YM2610 loop unchanged,
+  ITCM +40 B. Host: tiles and samples as read (NEO_BLOB_SUM=1, READSUM),
+  and 15 state/picture/audio hashes, identical to the previous build on
+  pspikes2 (.neo), sengoku3_dec, preisle2_dec (96 + 12 pieces), viewpoin,
+  mslug2, kotm2. The host flash cache holds 256 blobs like the firmware's
+  (it held 64).
+- The first launch's sprite copy reads the chips in blocks (up to 16 KiB
+  of each chip at a time, sized to the RAM left) and writes each block to
+  flash at once; it read 64 bytes from one chip then the other per tile.
+  A zip stored uncompressed (as tools/decrypt_neogeo_zip writes them) reads
+  straight from the card, so every tile cost two seeks: sengoku3_dec on the
+  host, 537,216 reads + 524,315 seeks -> 10,880 + 2,075. The .neo loader
+  reads blocks too (it read a tile at a time). Cached data identical
+  (host NEO_BLOB_SUM=1: every blob of pspikes2 .neo, sengoku3_dec,
+  viewpoin, mslug2, kotm2; the same sprites from zip and .neo; a flipped
+  byte changes the sum).
 - An encrypted MAME zip (sprite chips but no fix-layer chip: the CMC42/
   CMC50 sets, e.g. sengoku3, kof99, garou, mslug3) is reported as
   encrypted, with the PC tool to decrypt it (tools/decrypt_neogeo_zip)

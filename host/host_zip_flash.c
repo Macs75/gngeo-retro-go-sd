@@ -10,7 +10,7 @@
 #include "gw_flash_alloc.h"
 
 #ifndef HOST_ZIP_MAX_BLOBS
-#define HOST_ZIP_MAX_BLOBS 64
+#define HOST_ZIP_MAX_BLOBS 256          /* the firmware's GW_FLASH_CACHE_MAX_FILES */
 #endif
 
 typedef struct {
@@ -137,6 +137,15 @@ const uint8_t *store_data_finish(flash_stream_t *st)
     if (st->done != st->total) {
         store_data_abort(st);
         return NULL;
+    }
+    /* NEO_BLOB_SUM=1: a checksum (FNV-1a 64) of every blob stored, to
+     * compare what two builds of a loader put in the cache */
+    if (getenv("NEO_BLOB_SUM")) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < st->total; i++)
+            h = (h ^ s_stream_buf[i]) * 1099511628211ull;
+        printf("BLOB %s %u %016llx\n", s_stream_key, (unsigned)st->total,
+               (unsigned long long)h);
     }
     st->active = false;
     data = s_stream_buf;

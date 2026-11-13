@@ -20,3 +20,9 @@ int neo_rom_bind_regions(const char *game_id,
                          const uint8_t *gfix, uint32_t g_sz,
                          const uint8_t *c, uint32_t c_sz,
                          const uint8_t *spr, uint32_t spr_sz);
+
+/* Before neo_rom_bind_regions: the loader has stored c_n sprite and v_n
+ * sample pieces straight in neo_tile_piece / neo_pcm_piece (neo_pieces.h);
+ * the bind fills the rest of both tables. Without it (a .gno), the bind
+ * takes c and v as whole regions. */
+void neo_rom_set_pieces(int c_n, int v_n);

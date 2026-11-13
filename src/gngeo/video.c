@@ -40,6 +40,11 @@
 #include "transpack.h"
 #include "gnutil.h"
 
+#include "neo_pieces.h"
+
+/* the sprite tiles' pieces (neo_pieces.h; set by neo_rom_bind_regions) */
+const uint8_t *neo_tile_piece[NEO_TILE_PIECES];
+
 extern int neogeo_fix_bank_type;
 unsigned int neogeo_frame_counter;
 
@@ -361,7 +366,7 @@ static __attribute__((noinline)) void draw_tile_clipped(unsigned int tileno, int
 	if (!memory.rom.tiles.p || memory.nb_of_tiles == 0)
 		return;
 	tileno = tileno % memory.nb_of_tiles;
-	g = (const neo_u32_ua *)&memory.rom.tiles.p[tileno << 7];
+	g = (const neo_u32_ua *)neo_tile_data(tileno);
 	ysk = (zy == 16) ? full_y_skip : dda_y_skip;
 
 	/* full width: the visible columns [i0, i1) of the 16 */

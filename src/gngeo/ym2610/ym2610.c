@@ -114,6 +114,7 @@
 #include "../state.h"
 #include "2610intf.h"
 #include "ym2610.h"
+#include "neo_pieces.h"
 
 /* Host + device share this file. Early-outs are on by default; A/B with
  *   make / make host CORE_C_DEFS+=-DNEO_YM_EARLYOUT=0
@@ -2210,6 +2211,9 @@ static void SSG_write(int r, int v) {
 #define ADPCMA_ADDRESS_SHIFT 8   /* adpcm A address shift */
 
 static u8 *pcmbufA;
+/* the sample ROM's pieces (neo_pieces.h; set by neo_rom_bind_regions) */
+const uint8_t *neo_pcm_piece[NEO_PCM_PIECES];
+const uint8_t *neo_pcmb_piece[NEO_PCM_PIECES];
 static u32 pcmsizeA;
 
 /* Algorithm and tables verified on real YM2610 */
@@ -2267,7 +2271,7 @@ static inline int jedi_lookup(int step16_plus_nib)
 			if (ch->now_addr & 1)
 				data = ch->now_data & 0x0f;
 			else {
-				ch->now_data = *(pcmbufA + (ch->now_addr >> 1));
+				ch->now_data = neo_pcm_byte(ch->now_addr >> 1);
 				data = (ch->now_data >> 4) & 0x0f;
 			}
 
@@ -2316,7 +2320,6 @@ static int OPNB_ADPCMA_render(int length)
 	for (j = 0; j < 6; j++) {
 		ADPCMA *ch = &YM2610.adpcma[j];
 		s32 *bl = NULL, *br = NULL;
-		const u8 *rom = pcmbufA;
 		u32 now_step, step, now_addr, end;
 		s32 acc, astep, out;
 		u8 now_data;
@@ -2358,7 +2361,7 @@ static int OPNB_ADPCMA_render(int length)
 					if (now_addr & 1)
 						data = now_data & 0x0f;
 					else {
-						now_data = rom[now_addr >> 1];
+						now_data = neo_pcm_byte(now_addr >> 1);
 						data = (now_data >> 4) & 0x0f;
 					}
 					now_addr++;
@@ -2751,7 +2754,7 @@ INLINE void OPNB_ADPCMB_CALC(ADPCMB *adpcmb) {
 			if (adpcmb->now_addr & 1) {
 				data = adpcmb->now_data & 0x0f;
 			} else {
-				adpcmb->now_data = *(pcmbufB + (adpcmb->now_addr >> 1));
+				adpcmb->now_data = neo_pcmb_byte(adpcmb->now_addr >> 1);
 				data = adpcmb->now_data >> 4;
 			}
 
@@ -3555,7 +3558,7 @@ void ym2610_mkstate(gzFile gzf, int mode) {
 			OPNB_ADPCMB_write(&YM2610.adpcmb, r + 0x10, YM2610.regs[r + 0x10]);
 
 		if (pcmbufB)
-			YM2610.adpcmb.now_data = *(pcmbufB + (YM2610.adpcmb.now_addr >> 1));
+			YM2610.adpcmb.now_data = neo_pcmb_byte(YM2610.adpcmb.now_addr >> 1);
 	}
 }
 
@@ -3726,7 +3729,7 @@ STATE_LOAD( ym2610 )
 	OPNB_ADPCMB_write(&YM2610.adpcmb, r + 0x10, YM2610.regs[r + 0x10]);
 
 	if (pcmbufB)
-	YM2610.adpcmb.now_data = *(pcmbufB + (YM2610.adpcmb.now_addr >> 1));
+	YM2610.adpcmb.now_data = neo_pcmb_byte(YM2610.adpcmb.now_addr >> 1);
 }
 
 #endif /* SAVE_STATE */
