@@ -654,6 +654,9 @@ static uint32_t s_prog_since_paint;
 static uint8_t s_prog_last_pct;
 static uint8_t s_prog_step;   /* 1..s_prog_steps while caching */
 static uint8_t s_prog_steps;
+/* Set when the plan did not look the small blobs up (prog_plan): a cache
+ * hit found later is credited to the progress then. */
+static uint8_t s_prog_credit_hits;
 static uint8_t s_page[256];
 static uint32_t s_page_used;
 
@@ -756,6 +759,16 @@ static int prog_bump(uint32_t n)
     return prog_redraw(s_prog_since_paint >= (64u * 1024u));
 }
 
+/* A blob found cached at load time that the plan counted as to-do. */
+static void prog_credit_hit(uint32_t n)
+{
+    if (!s_prog_credit_hits)
+        return;
+    s_prog_done += n;
+    if (s_prog_done > s_prog_total && s_prog_total)
+        s_prog_done = s_prog_total;
+}
+
 static void prog_finish(void)
 {
     if (s_prog_total)
@@ -797,14 +810,20 @@ static void prog_plan(const ROM_DEF *drv, const char *stem)
     uint32_t sfix = drv->romsize[REGION_FIXED_LAYER_CARTRIDGE];
     uint32_t gfix = sfix >> 5;
     uint32_t spr = (tiles >> 11) * 4u;
-    int hit_p = key_hit(stem, "p2", p, NULL);
-    int hit_m = key_hit(stem, "m", m, NULL);
-    int hit_v = key_hit(stem, "v", v, NULL);
-    int hit_s = key_hit(stem, "s", sfix, NULL) &&
-                key_hit(stem, "gfix", gfix, NULL);
+    /* A lookup marks a blob in use for the whole session, and the firmware
+     * never erases one in use. So while the sprite chips still have to be
+     * stored (first, see neo_zip_flash_load), the other blobs are not looked
+     * up here: a copy cached by an earlier try would block the run the
+     * sprite chips need. They are counted as to-do, and credited if found. */
     int hit_c = key_hit(stem, "c", tiles, NULL) &&
                 key_hit(stem, "spr", spr, NULL);
+    int hit_p = hit_c && key_hit(stem, "p2", p, NULL);
+    int hit_m = hit_c && key_hit(stem, "m", m, NULL);
+    int hit_v = hit_c && key_hit(stem, "v", v, NULL);
+    int hit_s = hit_c && key_hit(stem, "s", sfix, NULL) &&
+                key_hit(stem, "gfix", gfix, NULL);
 
+    s_prog_credit_hits = !hit_c;
     s_prog_done = 0;
     s_prog_total = p + m + v + sfix + gfix + tiles + spr;
     s_prog_since_paint = 0;
@@ -1058,6 +1077,7 @@ static int ensure_raw_region(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
     make_key(key, sizeof(key), stem, suf, NULL);
     hit = lookup_data_in_flash(key, &got);
     if (hit && got == expect) {
+        prog_credit_hit(got);
         *out_ptr = hit;
         *out_sz = got;
         return 1;
@@ -1104,6 +1124,7 @@ static int ensure_sfix(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
     hit_s = lookup_data_in_flash(key_s, &got_s);
     hit_g = lookup_data_in_flash(key_g, &got_g);
     if (hit_s && got_s == sfix_sz && hit_g && got_g == gfix_sz) {
+        prog_credit_hit(sfix_sz + gfix_sz);
         *s_out = hit_s;
         *s_sz = got_s;
         *g_out = hit_g;
@@ -1570,14 +1591,14 @@ int neo_zip_flash_load(const char *zip_path)
 
     printf("neo_zip: loading %s → neogeo/%s/*\n", zip_path, stem);
 
-    if (!ensure_raw_region(z, drv, stem, "p2", REGION_MAIN_CPU_CARTRIDGE,
-                           drv->romsize[REGION_MAIN_CPU_CARTRIDGE], &p, &p_sz) ||
-        !ensure_raw_region(z, drv, stem, "m", REGION_AUDIO_CPU_CARTRIDGE,
-                           drv->romsize[REGION_AUDIO_CPU_CARTRIDGE], &m, &m_sz) ||
-        !ensure_raw_region(z, drv, stem, "v", REGION_AUDIO_DATA_1,
-                           drv->romsize[REGION_AUDIO_DATA_1], &v, &v_sz) ||
-        !ensure_sfix(z, drv, stem, &s, &s_sz, &gfix, &g_sz)) {
-        printf("neo_zip: fail before tiles: %s (RAM free=%u)\n",
+    /* The sprite chips first: the largest blob needs one contiguous run of
+     * flash that avoids everything this session has already mapped (the
+     * firmware never erases a blob in use). Stored after p/m/v/s, it could
+     * find the cache split by them and fail with most of the flash free
+     * (sengoku3: 32 MiB after 17.4 MB). The spr staging is dropped by the
+     * scratch refresh before the sfix staging is taken. */
+    if (!ensure_tiles(z, drv, stem, &c, &c_sz, &spr, &spr_sz)) {
+        printf("neo_zip: fail tiles: %s (RAM free=%u)\n",
                zip_err, (unsigned)ram_get_free_size());
         neo_zip_close(z);
         neo_zip_set_scratch(NULL, 0);
@@ -1585,16 +1606,20 @@ int neo_zip_flash_load(const char *zip_path)
         return 0;
     }
 
-    /* sfix/gfix staging (~132 KiB) must be dropped before spr_usage
-     * (64 KiB): together with inflate scratch they exceed residual RAM_EMU. */
     if (!refresh_zip_scratch(scratch_need)) {
         neo_zip_close(z);
         ram_init();
         return 0;
     }
 
-    if (!ensure_tiles(z, drv, stem, &c, &c_sz, &spr, &spr_sz)) {
-        printf("neo_zip: fail tiles: %s (RAM free=%u)\n",
+    if (!ensure_raw_region(z, drv, stem, "p2", REGION_MAIN_CPU_CARTRIDGE,
+                           drv->romsize[REGION_MAIN_CPU_CARTRIDGE], &p, &p_sz) ||
+        !ensure_raw_region(z, drv, stem, "m", REGION_AUDIO_CPU_CARTRIDGE,
+                           drv->romsize[REGION_AUDIO_CPU_CARTRIDGE], &m, &m_sz) ||
+        !ensure_raw_region(z, drv, stem, "v", REGION_AUDIO_DATA_1,
+                           drv->romsize[REGION_AUDIO_DATA_1], &v, &v_sz) ||
+        !ensure_sfix(z, drv, stem, &s, &s_sz, &gfix, &g_sz)) {
+        printf("neo_zip: fail after tiles: %s (RAM free=%u)\n",
                zip_err, (unsigned)ram_get_free_size());
         neo_zip_close(z);
         neo_zip_set_scratch(NULL, 0);
@@ -1701,6 +1726,7 @@ static int neo_ensure_raw(FILE *f, const char *stem, const char *suf,
     make_key(key, sizeof(key), stem, suf, "neo");
     hit = lookup_data_in_flash(key, &got);
     if (hit && got == expect) {
+        prog_credit_hit(got);
         *out_ptr = hit;
         *out_sz = got;
         return 1;
@@ -1762,6 +1788,7 @@ static int neo_ensure_sfix(FILE *f, const char *stem, uint32_t file_off,
     hit_s = lookup_data_in_flash(key_s, &got_s);
     hit_g = lookup_data_in_flash(key_g, &got_g);
     if (hit_s && got_s == sfix_sz && hit_g && got_g == gfix_sz) {
+        prog_credit_hit(sfix_sz + gfix_sz);
         *s_out = hit_s;
         *s_sz = sfix_sz;
         *g_out = hit_g;
@@ -1979,28 +2006,34 @@ int neo_neo_flash_load(const char *neo_path)
     s_prog_last_pct = 0xff;
     s_prog_hdr[0] = 0;
 
-    if (!key_hit(stem, "p2", sz.p, "neo"))
-        s_prog_steps++;
-    else
-        s_prog_done += sz.p;
-    if (!key_hit(stem, "m", sz.m, "neo"))
-        s_prog_steps++;
-    else
-        s_prog_done += sz.m;
-    if (!key_hit(stem, "v", sz.v, "neo"))
-        s_prog_steps++;
-    else
-        s_prog_done += sz.v;
-    if (!(key_hit(stem, "s", sz.s, "neo") &&
-          key_hit(stem, "gfix", gfix_sz, "neo")))
-        s_prog_steps = (uint8_t)(s_prog_steps + 2);
-    else
-        s_prog_done += sz.s + gfix_sz;
-    if (!(key_hit(stem, "c", sz.c, "neo") &&
-          key_hit(stem, "spr", spr_sz_expect, "neo")))
-        s_prog_steps = (uint8_t)(s_prog_steps + 2);
-    else
-        s_prog_done += sz.c + spr_sz_expect;
+    /* As prog_plan: the other blobs are looked up only once the sprite
+     * chips are cached. */
+    {
+        int hit_c = key_hit(stem, "c", sz.c, "neo") &&
+                    key_hit(stem, "spr", spr_sz_expect, "neo");
+        s_prog_credit_hits = !hit_c;
+        if (!(hit_c && key_hit(stem, "p2", sz.p, "neo")))
+            s_prog_steps++;
+        else
+            s_prog_done += sz.p;
+        if (!(hit_c && key_hit(stem, "m", sz.m, "neo")))
+            s_prog_steps++;
+        else
+            s_prog_done += sz.m;
+        if (!(hit_c && key_hit(stem, "v", sz.v, "neo")))
+            s_prog_steps++;
+        else
+            s_prog_done += sz.v;
+        if (!(hit_c && key_hit(stem, "s", sz.s, "neo") &&
+              key_hit(stem, "gfix", gfix_sz, "neo")))
+            s_prog_steps = (uint8_t)(s_prog_steps + 2);
+        else
+            s_prog_done += sz.s + gfix_sz;
+        if (!hit_c)
+            s_prog_steps = (uint8_t)(s_prog_steps + 2);
+        else
+            s_prog_done += sz.c + spr_sz_expect;
+    }
     if (s_prog_done > s_prog_total)
         s_prog_done = s_prog_total;
 
@@ -2032,21 +2065,22 @@ int neo_neo_flash_load(const char *neo_path)
 
     ram_init();
 
-    if (!neo_ensure_raw(f, stem, "p2", "prom", off_p, sz.p, &p, &p_sz) ||
-        !neo_ensure_raw(f, stem, "m", "mrom", off_m, sz.m, &m, &m_sz) ||
-        !neo_ensure_raw(f, stem, "v", "vrom", off_v, sz.v, &v, &v_sz) ||
-        !neo_ensure_sfix(f, stem, off_s, sz.s, &s, &s_sz, &gfix, &g_sz)) {
-        printf("neo_neo: fail before tiles: %s\n", zip_err);
+    /* The sprite chips first, as in the zip path (neo_zip_flash_load). */
+    if (!neo_ensure_tiles(f, stem, off_c, sz.c, &c, &c_sz, &spr, &spr_sz)) {
+        printf("neo_neo: fail tiles: %s\n", zip_err);
         fclose(f);
         ram_init();
         return 0;
     }
 
-    /* Drop sfix staging before spr_usage (same as zip path). */
+    /* Drop the spr staging before the sfix staging (same as zip path). */
     ram_init();
 
-    if (!neo_ensure_tiles(f, stem, off_c, sz.c, &c, &c_sz, &spr, &spr_sz)) {
-        printf("neo_neo: fail tiles: %s\n", zip_err);
+    if (!neo_ensure_raw(f, stem, "p2", "prom", off_p, sz.p, &p, &p_sz) ||
+        !neo_ensure_raw(f, stem, "m", "mrom", off_m, sz.m, &m, &m_sz) ||
+        !neo_ensure_raw(f, stem, "v", "vrom", off_v, sz.v, &v, &v_sz) ||
+        !neo_ensure_sfix(f, stem, off_s, sz.s, &s, &s_sz, &gfix, &g_sz)) {
+        printf("neo_neo: fail after tiles: %s\n", zip_err);
         fclose(f);
         ram_init();
         return 0;
