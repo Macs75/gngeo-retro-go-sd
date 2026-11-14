@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Scrambled sprites in Art of Fighting, Viewpoint, Fatal Fury 2, King of
+  the Monsters 2, Sengoku 2, 3 Count Bout, Super Sidekicks and World
+  Heroes from romsets other than MAME's (e.g. NeoRAGE's): their sprite
+  chips come with the two halves already in place, and v0.0.6 moved them
+  again. The halves are now moved only for MAME's chips, recognised by
+  their CRC; any other dump is laid out as it is. A scrambled copy left
+  in the flash cache is not reused.
+
 ## [v0.0.6] - 2026-11-13
 
 ### Added

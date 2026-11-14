@@ -320,13 +320,25 @@ static int append_rom_files(ROM_DEF *drv, const neo_chip_t *arr, int n,
  * first; a smaller chip is whole at its base. The region is 0x600000, or
  * 0x800000 when C3/C4 are split too; what no chip covers is empty. Laid
  * back to back (as every other cart), the second halves land 2 MiB low
- * and their tiles are garbage (Viewpoint's backgrounds). The carts, by
- * NGH number: kotm2 039, sengoku2 040, 3countb 043, aof 044, fatfury2 047,
- * viewpoin 051, ssideki 052, wh1 053 (MAME neogeo.cpp).
+ * and their tiles are garbage (Viewpoint's backgrounds). The carts: kotm2
+ * 039, sengoku2 040, 3countb 043, aof 044, fatfury2 047, viewpoin 051,
+ * ssideki 052, wh1 053 (MAME neogeo.cpp; their clones use the same chips).
+ *
+ * Only the chips as MAME dumps them (also FBNeo's, and old MAME's .bin
+ * names) are in that order; other dumps of these carts come with the
+ * halves already moved (NeoRAGE: its aof C1 holds MAME C1's first half and
+ * C3's first half), so laid back to back they are right, and moving their
+ * halves scrambles them. The data cannot tell the two apart (the same
+ * 1 MiB blocks in another order), so MAME's chips are recognised by the
+ * CRC of their C1, one per cart.
  */
 static int s_crom_split;
+/* One of those carts in another dump (halves already moved), laid back to
+ * back: its tiles are cached under their own names ("cl", "sprl"), so a
+ * copy an older core cached with the halves moved (scrambled) is not used. */
+static int s_crom_lin;
 
-static int crom_split_cart(const char *c1_name)
+static int crom_split_ngh(const char *c1_name)
 {
     static const char ngh[][4] = { "039", "040", "043", "044", "047", "051", "052", "053" };
     unsigned i;
@@ -338,6 +350,25 @@ static int crom_split_cart(const char *c1_name)
     return 0;
 }
 
+static int crom_split_cart(uint32_t c1_crc)
+{
+    static const uint32_t mame_c1[] = {
+        0x6d1c4aa9u,    /* 039-c1.c1 kotm2 */
+        0xfaa8ea99u,    /* 040-c1.c1 sengoku2 */
+        0xbad2d67fu,    /* 043-c1.c1 3countb */
+        0xddab98a7u,    /* 044-c1.c1 aof */
+        0xf72a939eu,    /* 047-c1.c1 fatfury2 */
+        0xd624c132u,    /* 051-c1.c1 viewpoin */
+        0x53e1c002u,    /* 052-c1.c1 ssideki */
+        0x85eb5bceu,    /* 053-c1.c1 wh1 */
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(mame_c1) / sizeof(mame_c1[0]); i++)
+        if (c1_crc == mame_c1[i])
+            return 1;
+    return 0;
+}
+
 static int append_crom_pairs(ROM_DEF *drv, const neo_chip_t *c, int nc,
                              uint32_t *tiles_out)
 {
@@ -345,7 +376,8 @@ static int append_crom_pairs(ROM_DEF *drv, const neo_chip_t *c, int nc,
     int i;
     if (nc < 2 || (nc & 1))
         return 0;
-    s_crom_split = nc <= 4 && crom_split_cart(c[0].name);
+    s_crom_split = nc <= 4 && crom_split_cart(c[0].crc);
+    s_crom_lin = nc <= 4 && !s_crom_split && crom_split_ngh(c[0].name);
     for (i = 0; i < nc; i += 2) {
         uint32_t sz = c[i].size;
         if (c[i + 1].size != sz)
@@ -540,6 +572,7 @@ static const ROM_DEF *rom_def_from_zip(neo_zip_t *z, const char *stem)
     s_auto_drv.romsize[REGION_AUDIO_DATA_1] = vsz;
     if (s_tidx.on) {
         s_crom_split = 0;
+        s_crom_lin = 0;
         csz = (s_tidx.idx_sz / 4u) * 128u;   /* every tile number */
         printf("neo_zip: indexed sprites: %u tiles, %u distinct\n",
                (unsigned)(s_tidx.idx_sz / 4u), (unsigned)(s_tidx.uniq_sz / 128u));
@@ -884,8 +917,8 @@ static void prog_plan(const ROM_DEF *drv, const char *stem)
     int hit_c = hit_p &&
                 (s_tidx.on ? key_hit_pieces(stem, "cu", s_tidx.uniq_sz, NULL) &&
                              key_hit_pieces(stem, "ci", s_tidx.idx_sz, NULL)
-                           : key_hit_pieces(stem, "c", tiles, NULL)) &&
-                key_hit(stem, "spr", spr, NULL);
+                           : key_hit_pieces(stem, s_crom_lin ? "cl" : "c", tiles, NULL)) &&
+                key_hit(stem, s_crom_lin ? "sprl" : "spr", spr, NULL);
     int hit_m = hit_c && key_hit(stem, "m", m, NULL);
     int hit_v = hit_c && key_hit_pieces(stem, "v", v, NULL);
     int hit_s = hit_c && key_hit(stem, "s", sfix, NULL) &&
@@ -1844,8 +1877,8 @@ static int ensure_tiles(neo_zip_t *z, const ROM_DEF *drv, const char *stem,
     if (s_tidx.on)
         return ensure_tiles_indexed(z, stem, pc, pi, spr_out, spr_sz);
 
-    make_key(key_c, sizeof(key_c), stem, "c", NULL);
-    make_key(key_spr, sizeof(key_spr), stem, "spr", NULL);
+    make_key(key_c, sizeof(key_c), stem, s_crom_lin ? "cl" : "c", NULL);
+    make_key(key_spr, sizeof(key_spr), stem, s_crom_lin ? "sprl" : "spr", NULL);
     all_c = pieces_lookup(pc, key_c, tiles, 1);
     if (!pc->n) {
         zip_set_err("ROM too large for flash");
