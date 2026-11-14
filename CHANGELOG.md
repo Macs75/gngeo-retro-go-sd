@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v0.0.7] - 2026-11-14
 
 ### Fixed
 
@@ -11,6 +11,27 @@
   again. The halves are now moved only for MAME's chips, recognised by
   their CRC; any other dump is laid out as it is. A scrambled copy left
   in the flash cache is not reused.
+
+### Install
+
+Release assets (attached to this GitHub release):
+
+- `gngeo-vx.x.x.zip` — SD install archive. Unzip onto the **root** of the SD
+  card (creates `/cores/gngeo.bin` and `/cores/gngeo.ro`).
+
+Also required on the SD card (not in the zip):
+
+- ROMs: `/roms/neogeo/*.gno` (XIP dumps via `tools/make_gno_xip.py`), `.neo`
+  carts and/or `/roms/neogeo/*.zip` (MAME sets, or other dumps such as
+  NeoRAGE's). Encrypted MAME sets must be decrypted first on a PC with
+  `tools/decrypt_neogeo_zip` (e.g. `mslug5_dec.zip`); sets too big for the
+  flash cache can then be indexed with `tools/neo_tile_index.py` (e.g.
+  `mslug5_idx.zip`).
+- BIOS (shared): `/bios/neogeo/uni-bios.rom` (or `uni-bios_4_0.rom` / `sp-s2.sp1`),
+  `sfix.sfix` (or `sfix.sfx`), and `000-lo.lo`.
+
+Firmware must match the ABI recorded in `SDK_VERSION` in this repository
+(`FIRMWARE_ABI_VERSION=2` at this release).
 
 ## [v0.0.6] - 2026-11-13
 
